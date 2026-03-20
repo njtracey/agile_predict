@@ -2,7 +2,6 @@ import xgboost as xg
 from pathlib import Path
 from sklearn.metrics import mean_squared_error as MSE
 from sklearn.model_selection import cross_val_score
-from sklearn.neighbors import KernelDensity
 from sklearn.model_selection import train_test_split
 
 import matplotlib
@@ -130,6 +129,12 @@ class Command(BaseCommand):
             action="store_true",
         )
 
+        parser.add_argument(
+            "--bootstrap",
+            action="store_true",
+            help="Skip forecast deletion so training data can accumulate across runs (use for initial setup only)",
+        )
+
     def handle(self, *args, **options):
         # Setup logging
 
@@ -178,10 +183,14 @@ class Command(BaseCommand):
             if debug:
                 logger.info(f"{f.id:5d} | {f.name} | {fd.count():5d} | {ad.count():7d} | {days:4d} | {fail}")
 
-        forecasts_to_delete = Forecasts.objects.exclude(id__in=keep)
-        if debug:
-            logger.info(f"\nDeleting ({forecasts_to_delete})\n")
-        forecasts_to_delete.delete()
+        bootstrap = options.get("bootstrap", False)
+        if bootstrap:
+            logger.info("Bootstrap mode: skipping forecast deletion so training data can accumulate")
+        else:
+            forecasts_to_delete = Forecasts.objects.exclude(id__in=keep)
+            if debug:
+                logger.info(f"\nDeleting ({forecasts_to_delete})\n")
+            forecasts_to_delete.delete()
 
         prices, start = model_to_df(PriceHistory)
 
@@ -189,20 +198,26 @@ class Command(BaseCommand):
             logger.info("Getting Historic Prices")
             logger.info(f"Prices\n{prices}")
 
-        agile = get_agile(start=start)
-        day_ahead = day_ahead_to_agile(agile, reverse=True)
+        # Pages arrive newest-first (descending); filter by original start so we
+        # don't re-write records already in the DB, but don't gate on prices.index[-1]
+        # (that would discard older pages as soon as one page is written).
+        all_agile_pages = []
+        for page_agile in get_agile_pages(start=start, region="F"):
+            all_agile_pages.append(page_agile)
+            page_day_ahead = day_ahead_to_agile(page_agile, reverse=True, region="F")
+            page_new = pd.concat([page_day_ahead, page_agile], axis=1)
+            page_new = page_new[page_new.index >= start]
+            if len(page_new) > 0:
+                if debug:
+                    logger.info(f"New Prices (page)\n{page_new}")
+                logger.info("Writing %d new price records to DB (up to %s)", len(page_new), page_new.index[-1])
+                df_to_Model(page_new, PriceHistory, update=True)
+                prices = pd.concat([prices, page_new]).sort_index()
 
-        new_prices = pd.concat([day_ahead, agile], axis=1)
-        if len(prices) > 0:
-            new_prices = new_prices[new_prices.index > prices.index[-1]]
-
-        if debug:
-            logger.info(f"New Prices\n{new_prices}")
-
-        if len(new_prices) > 0:
-            logger.info(new_prices)
-            df_to_Model(new_prices, PriceHistory)
-            prices = pd.concat([prices, new_prices]).sort_index()
+        agile = pd.concat(all_agile_pages).sort_index() if all_agile_pages else pd.Series(name="agile", dtype=float)
+        agile = agile[~agile.index.duplicated(keep="last")]
+        day_ahead = day_ahead_to_agile(agile, reverse=True, region="F")
+        prices = prices[~prices.index.duplicated(keep="last")]
 
         agile_end = prices.index[-1]
         gb60 = get_gb60()
@@ -251,6 +266,7 @@ class Command(BaseCommand):
                 if len(fc) > 0:
                     fd = pd.DataFrame(list(ForecastData.objects.exclude(forecast_id__in=ignore_forecast).values()))
                     ff = pd.DataFrame(list(Forecasts.objects.exclude(id__in=ignore_forecast).values()))
+                    scores = []  # initialise so line 707 ref is safe if training block is skipped (e.g. first run)
 
                     if len(ff) > 0:
                         logger.info(ff)
@@ -290,16 +306,27 @@ class Command(BaseCommand):
                         df["dt"] = (df.index - df["created_at"]).dt.total_seconds() / 3600 / 24
                         df["peak"] = ((df["time"] >= 16) & (df["time"] < 19)).astype(float)
 
+                        # Cyclical time encoding for seasonal/diurnal patterns
+                        time_gb = df.index.tz_convert("GB")
+                        hour = time_gb.hour + time_gb.minute / 60
+                        month = time_gb.month
+                        df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+                        df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+                        df["month_sin"] = np.sin(2 * np.pi * month / 12)
+                        df["month_cos"] = np.cos(2 * np.pi * month / 12)
+
                         features = [
                             "bm_wind",
                             "solar",
                             "demand",
-                            # "time",
                             "peak",
                             "days_ago",
-                            # "dow",
                             "wind_10m",
                             "weekend",
+                            "hour_sin",
+                            "hour_cos",
+                            "month_sin",
+                            "month_cos",
                         ]
 
                         # Only use the forecasts closest to 16:15 for training
@@ -322,19 +349,27 @@ class Command(BaseCommand):
 
                         xg_model = xg.XGBRegressor(
                             objective="reg:squarederror",
-                            booster="dart",
-                            gamma=0.2,
-                            subsample=1.0,
-                            n_estimators=200,
-                            max_depth=10,
-                            colsample_bytree=1,
+                            booster="gbtree",
+                            learning_rate=0.0135,
+                            max_depth=8,
+                            subsample=0.775,
+                            colsample_bytree=0.604,
+                            n_estimators=150,
+                            gamma=0.093,
+                            min_child_weight=4,
+                            reg_alpha=0.003,
+                            reg_lambda=0.0095,
                         )
 
-                        scores = cross_val_score(
-                            xg_model, train_X, train_y, cv=5, scoring="neg_root_mean_squared_error"
-                        )
-
-                        logger.info(f"Cross-val scrore: {scores}")
+                        n_cv = min(5, len(train_X) // 2)
+                        if n_cv >= 2:
+                            scores = cross_val_score(
+                                xg_model, train_X, train_y, cv=n_cv, scoring="neg_root_mean_squared_error"
+                            )
+                            logger.info(f"Cross-val scrore: {scores}")
+                        else:
+                            scores = np.array([0.0])
+                            logger.info("Too few training samples for cross-validation (n=%d) — skipping cv", len(train_X))
 
                         xg_model.fit(train_X, train_y, sample_weight=sample_weights, verbose=True)
 
@@ -552,44 +587,82 @@ class Command(BaseCommand):
                     fc["days_ago"] = 0
                     fc["time"] = fc.index.tz_convert("GB").hour + fc.index.minute / 60
                     fc["dt"] = (fc.index - pd.Timestamp.now(tz="UTC")).total_seconds() / 86400
+
+                    # Cyclical time encoding for prediction data
+                    fc_time_gb = fc.index.tz_convert("GB")
+                    fc_hour = fc_time_gb.hour + fc_time_gb.minute / 60
+                    fc_month = fc_time_gb.month
+                    fc["hour_sin"] = np.sin(2 * np.pi * fc_hour / 24)
+                    fc["hour_cos"] = np.cos(2 * np.pi * fc_hour / 24)
+                    fc["month_sin"] = np.sin(2 * np.pi * fc_month / 12)
+                    fc["month_cos"] = np.cos(2 * np.pi * fc_month / 12)
+
                     if len(ff) > 0:
-                        fc["day_ahead"] = xg_model.predict(
-                            fc.drop("emb_wind", axis=1).reindex(train_X.columns, axis=1)
-                        )
+                        fc_pred_input = fc.drop("emb_wind", axis=1).reindex(train_X.columns, axis=1)
+                        fc["day_ahead"] = xg_model.predict(fc_pred_input)
 
                         if (len(test_X) > 10) and (not no_ranges):
-                            kde = KernelDensity()
-                            kde.fit(results[["dt", "pred", "day_ahead"]].to_numpy())
+                            # Graduated quantile regression: tighter bands near-term,
+                            # wider far-term for consistent ~5% exceedance per horizon
+                            qr_schedule = [
+                                (-2, 2, 0.12, 0.88),   # days 0-2: tight
+                                (2, 4, 0.08, 0.92),    # days 2-4: medium
+                                (4, 7, 0.05, 0.95),    # days 4-7: wider
+                                (7, 15, 0.03, 0.97),   # days 7-14: widest
+                            ]
 
-                            xlim = (
-                                np.floor(results[["pred", "day_ahead"]].min(axis=1).min() / 11) * 10,
-                                np.ceil(results[["pred", "day_ahead"]].max(axis=1).max() / 9) * 10,
-                            )
+                            # Train quantile models (reuse same training data)
+                            qr_models = {}
+                            for _, _, q_lo, q_hi in qr_schedule:
+                                if (q_lo, q_hi) not in qr_models:
+                                    qr_params_lo = dict(
+                                        objective="reg:quantileerror",
+                                        quantile_alpha=q_lo,
+                                        booster="gbtree",
+                                        learning_rate=0.0135,
+                                        max_depth=8,
+                                        subsample=0.775,
+                                        colsample_bytree=0.604,
+                                        n_estimators=150,
+                                        gamma=0.093,
+                                        min_child_weight=4,
+                                        reg_alpha=0.003,
+                                        reg_lambda=0.0095,
+                                    )
+                                    qr_params_hi = dict(qr_params_lo)
+                                    qr_params_hi["quantile_alpha"] = q_hi
 
-                            fc = pd.concat(
-                                [
-                                    fc,
-                                    pd.DataFrame(
-                                        index=fc.index,
-                                        data=kde_quantiles(
-                                            kde,
-                                            fc["dt"].to_list(),
-                                            fc["day_ahead"].to_list(),
-                                            lim=xlim,
-                                            quantiles={"day_ahead_low": 0.1, "day_ahead_high": 0.9},
-                                        ),
-                                    ),
-                                ],
-                                axis=1,
-                            )
+                                    m_lo = xg.XGBRegressor(**qr_params_lo)
+                                    m_lo.fit(train_X, train_y, sample_weight=sample_weights, verbose=False)
+                                    m_hi = xg.XGBRegressor(**qr_params_hi)
+                                    m_hi.fit(train_X, train_y, sample_weight=sample_weights, verbose=False)
+                                    qr_models[(q_lo, q_hi)] = (
+                                        m_lo.predict(fc_pred_input),
+                                        m_hi.predict(fc_pred_input),
+                                    )
 
-                            for case in ["low", "high"]:
-                                fc[f"day_ahead_{case}"] = (
-                                    fc[f"day_ahead_{case}"].rolling(3, center=True).mean().bfill().ffill()
-                                )
+                            # Assign bands per horizon bucket
+                            horizon_days = fc["dt"].values
+                            low_pred = np.full(len(fc), np.nan)
+                            high_pred = np.full(len(fc), np.nan)
 
-                            fc["day_ahead_low"] = fc[["day_ahead", "day_ahead_low"]].min(axis=1)
-                            fc["day_ahead_high"] = fc[["day_ahead", "day_ahead_high"]].max(axis=1)
+                            for h_lo, h_hi, q_lo, q_hi in qr_schedule:
+                                mask = (horizon_days >= h_lo) & (horizon_days < h_hi)
+                                ml_pred, mh_pred = qr_models[(q_lo, q_hi)]
+                                low_pred[mask] = ml_pred[mask]
+                                high_pred[mask] = mh_pred[mask]
+
+                            # Fallback for any unassigned slots (use widest quantile)
+                            remaining = np.isnan(low_pred)
+                            if remaining.any():
+                                widest_q = (qr_schedule[-1][2], qr_schedule[-1][3])
+                                ml_pred, mh_pred = qr_models[widest_q]
+                                low_pred[remaining] = ml_pred[remaining]
+                                high_pred[remaining] = mh_pred[remaining]
+
+                            # Ensure low <= point <= high
+                            fc["day_ahead_low"] = np.minimum(low_pred, fc["day_ahead"].values)
+                            fc["day_ahead_high"] = np.maximum(high_pred, fc["day_ahead"].values)
 
                         else:
                             fc["day_ahead_low"] = fc["day_ahead"] * 0.9
@@ -702,7 +775,9 @@ class Command(BaseCommand):
                         logger.info(f"Final forecast from {fc.index[0]} to {fc.index[-1]}")
                         logger.info(f"Forecast\n{fc}")
 
-                    this_forecast = Forecasts(name=new_name, mean=-np.mean(scores), stdev=np.std(scores))
+                    mean_score = -np.mean(scores) if len(scores) > 0 else 0.0
+                    stdev_score = np.std(scores) if len(scores) > 0 else 0.0
+                    this_forecast = Forecasts(name=new_name, mean=mean_score, stdev=stdev_score)
                     this_forecast.save()
                     fc["forecast"] = this_forecast
                     ag["forecast"] = this_forecast

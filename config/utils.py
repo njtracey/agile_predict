@@ -492,37 +492,69 @@ class DataSet:
         return df, None
 
 
-def get_agile(start=pd.Timestamp("2023-07-01"), tz="GB", region="G"):
+def get_agile_pages(start=pd.Timestamp("2023-07-01"), tz="GB", region="G"):
+    """Yield one page of Agile prices at a time (for incremental DB writes).
+
+    Each yielded value is a pandas Series named "agile" covering up to 1500
+    half-hour slots. Retries on HTTP 429 with exponential backoff; logs
+    progress per page so callers can monitor long backfills.
+    """
     start = pd.Timestamp(start).tz_convert("UTC")
     product = "AGILE-24-10-01"
-    df = pd.DataFrame()
-    url = f"{OCTOPUS_PRODUCT_URL}{product}"
-
     end = pd.Timestamp.now(tz="UTC").normalize() + pd.Timedelta("48h")
     code = f"E-1R-{product}-{region}"
-    url = url + f"/electricity-tariffs/{code}/standard-unit-rates/"
+    url = OCTOPUS_PRODUCT_URL + f"{product}/electricity-tariffs/{code}/standard-unit-rates/"
 
-    x = []
+    _PAGE_DELAY = 2      # seconds between successful page fetches
+    _MAX_RETRIES = 5     # max retries per page on 429
+    _RETRY_DELAY = 60    # base seconds to wait on 429 (multiplied by attempt)
+    page_num = 0
+
     while end > start:
-        # print(start, end)
+        page_num += 1
         params = {
             "page_size": 1500,
             "order_by": "period",
             "period_from": _oct_time(start),
             "period_to": _oct_time(end),
         }
+        logger.info("Page %d: fetching %s → %s", page_num, _oct_time(start), _oct_time(end))
 
-        r = requests.get(url, params=params)
-        if "results" in r.json():
-            x = x + r.json()["results"]
-        end = pd.Timestamp(x[-1]["valid_from"]).ceil("24h")
+        for attempt in range(_MAX_RETRIES):
+            r = requests.get(url, params=params, headers={"User-Agent": "curl/7.64.1"})
+            if r.status_code == 429:
+                wait = _RETRY_DELAY * (attempt + 1)
+                logger.warning("Octopus API 429 on attempt %d/%d — waiting %ds", attempt + 1, _MAX_RETRIES, wait)
+                time.sleep(wait)
+            else:
+                break
+        else:
+            raise RuntimeError(f"Octopus API returned 429 after {_MAX_RETRIES} retries — aborting")
 
-    df = pd.DataFrame(x).set_index("valid_from")[["value_inc_vat"]]
-    df.index = pd.to_datetime(df.index)
-    df.index = df.index.tz_convert(tz)
-    df = df.sort_index()["value_inc_vat"]
-    df = df[~df.index.duplicated()]
-    return df.rename("agile")
+        results = r.json().get("results", [])
+        if not results:
+            logger.info("Page %d: no results returned — backfill complete", page_num)
+            break
+
+        logger.info("Page %d: got %d records up to %s", page_num, len(results), results[-1]["valid_from"])
+
+        page_df = pd.DataFrame(results).set_index("valid_from")[["value_inc_vat"]]
+        page_df.index = pd.to_datetime(page_df.index).tz_convert(tz)
+        page_df = page_df.sort_index()["value_inc_vat"]
+        page_df = page_df[~page_df.index.duplicated()]
+        yield page_df.rename("agile")
+
+        end = pd.Timestamp(results[-1]["valid_from"]).ceil("24h")
+        time.sleep(_PAGE_DELAY)
+
+
+def get_agile(start=pd.Timestamp("2023-07-01"), tz="GB", region="G"):
+    """Fetch all Agile prices from start to now as a single Series."""
+    pages = list(get_agile_pages(start=start, tz=tz, region=region))
+    if not pages:
+        return pd.Series(name="agile", dtype=float)
+    df = pd.concat(pages).sort_index()
+    return df[~df.index.duplicated()]
 
 
 def day_ahead_to_agile(df, reverse=False, region="G"):
