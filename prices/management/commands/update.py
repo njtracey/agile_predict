@@ -94,13 +94,7 @@ class Command(BaseCommand):
             action="store_true",
         )
 
-        parser.add_argument(
-            "--min_fd",
-        )
-
-        parser.add_argument(
-            "--min_ad",
-        )
+        # --min_fd and --min_ad removed: new smart cleanup doesn't need them
 
         parser.add_argument(
             "--max_days",
@@ -129,19 +123,13 @@ class Command(BaseCommand):
             action="store_true",
         )
 
-        parser.add_argument(
-            "--bootstrap",
-            action="store_true",
-            help="Skip forecast deletion so training data can accumulate across runs (use for initial setup only)",
-        )
+        # --bootstrap removed: new smart cleanup strategy is inherently safe for cold start
 
     def handle(self, *args, **options):
         # Setup logging
 
         debug = options.get("debug", False)
 
-        min_fd = int(options.get("min_fd", 600) or 600)
-        min_ad = int(options.get("min_ad", 1500) or 1500)
         max_days = int(options.get("max_days", 60) or 60)
 
         no_ranges = options.get("no_ranges", False)
@@ -157,40 +145,8 @@ class Command(BaseCommand):
         else:
             ignore_forecast = [int(x) for x in options.get("ignore_forecast", [])]
 
-        # Clean any invalid forecasts
-        if debug:
-            logger.info(f"Max days: {max_days}")
-
-            logger.info(f"  ID  |       Name       |  #FD  |   #AD   | Days |")
-            logger.info(f"------+------------------+-------+---------+------+")
-        keep = []
-        for f in Forecasts.objects.all().order_by("-created_at"):
-            fd = ForecastData.objects.filter(forecast=f)
-            ad = AgileData.objects.filter(forecast=f)
-            dt = pd.to_datetime(f.name).tz_localize("GB")
-            days = (pd.Timestamp.now(tz="GB") - dt).days
-            if fd.count() < min_fd or ad.count() < min_ad:
-                fail = " <- Fail"
-            else:
-                fail = " <- Manual"
-                if days < max_days * 2:
-                    for hour in [6, 10, 11, 16, 22]:
-                        if f"{hour:02d}:15" in f.name:
-                            keep.append(f.id)
-                            fail = ""
-                else:
-                    fail = "<- Old"
-            if debug:
-                logger.info(f"{f.id:5d} | {f.name} | {fd.count():5d} | {ad.count():7d} | {days:4d} | {fail}")
-
-        bootstrap = options.get("bootstrap", False)
-        if bootstrap:
-            logger.info("Bootstrap mode: skipping forecast deletion so training data can accumulate")
-        else:
-            forecasts_to_delete = Forecasts.objects.exclude(id__in=keep)
-            if debug:
-                logger.info(f"\nDeleting ({forecasts_to_delete})\n")
-            forecasts_to_delete.delete()
+        # Cleanup runs AFTER prediction+save (see end of handle) to ensure
+        # the current run's output exists before any deletion.
 
         prices, start = model_to_df(PriceHistory)
 
@@ -210,11 +166,19 @@ class Command(BaseCommand):
             if len(page_new) > 0:
                 if debug:
                     logger.info(f"New Prices (page)\n{page_new}")
-                logger.info("Writing %d new price records to DB (up to %s)", len(page_new), page_new.index[-1])
+                logger.info(
+                    "Writing %d new price records to DB (up to %s)",
+                    len(page_new),
+                    page_new.index[-1],
+                )
                 df_to_Model(page_new, PriceHistory, update=True)
                 prices = pd.concat([prices, page_new]).sort_index()
 
-        agile = pd.concat(all_agile_pages).sort_index() if all_agile_pages else pd.Series(name="agile", dtype=float)
+        agile = (
+            pd.concat(all_agile_pages).sort_index()
+            if all_agile_pages
+            else pd.Series(name="agile", dtype=float)
+        )
         agile = agile[~agile.index.duplicated(keep="last")]
         day_ahead = day_ahead_to_agile(agile, reverse=True, region="F")
         prices = prices[~prices.index.duplicated(keep="last")]
@@ -231,7 +195,9 @@ class Command(BaseCommand):
             gb60 = gb60.reindex(
                 pd.date_range(gb60.index[0], gb60.index[-1] + pd.Timedelta("30min"), freq="30min")
             ).ffill()
-            gb60 = pd.concat([gb60, day_ahead_to_agile(gb60)], axis=1).set_axis(["day_ahead", "agile"], axis=1)
+            gb60 = pd.concat([gb60, day_ahead_to_agile(gb60)], axis=1).set_axis(
+                ["day_ahead", "agile"], axis=1
+            )
             prices = pd.concat([prices, gb60]).sort_index()
 
         if debug:
@@ -245,12 +211,17 @@ class Command(BaseCommand):
 
         new_name = pd.Timestamp.now(tz="GB").strftime("%Y-%m-%d %H:%M")
         if new_name not in [f.name for f in Forecasts.objects.all()]:
-            base_forecasts = Forecasts.objects.exclude(id__in=ignore_forecast).order_by("-created_at")
+            base_forecasts = Forecasts.objects.exclude(id__in=ignore_forecast).order_by(
+                "-created_at"
+            )
             last_forecasts = {
-                forecast.created_at.date(): forecast.id for forecast in base_forecasts.order_by("created_at")
+                forecast.created_at.date(): forecast.id
+                for forecast in base_forecasts.order_by("created_at")
             }
 
-            base_forecasts = base_forecasts.filter(id__in=[last_forecasts[k] for k in last_forecasts])
+            base_forecasts = base_forecasts.filter(
+                id__in=[last_forecasts[k] for k in last_forecasts]
+            )
 
             if debug:
                 logger.info("Getting latest Forecast")
@@ -258,14 +229,20 @@ class Command(BaseCommand):
             fc, missing_fc = get_latest_forecast()
 
             if len(missing_fc) > 0:
-                logger.error(f">>> ERROR: Unable to run forecast due to missing columns: {', '.join(missing_fc)}")
+                logger.error(
+                    f">>> ERROR: Unable to run forecast due to missing columns: {', '.join(missing_fc)}"
+                )
             else:
                 if debug:
                     logger.info(fc)
 
                 if len(fc) > 0:
-                    fd = pd.DataFrame(list(ForecastData.objects.exclude(forecast_id__in=ignore_forecast).values()))
-                    ff = pd.DataFrame(list(Forecasts.objects.exclude(id__in=ignore_forecast).values()))
+                    fd = pd.DataFrame(
+                        list(ForecastData.objects.exclude(forecast_id__in=ignore_forecast).values())
+                    )
+                    ff = pd.DataFrame(
+                        list(Forecasts.objects.exclude(id__in=ignore_forecast).values())
+                    )
                     scores = []  # initialise so line 707 ref is safe if training block is skipped (e.g. first run)
 
                     if len(ff) > 0:
@@ -278,7 +255,11 @@ class Command(BaseCommand):
 
                         # Only train on the forecasts closest to 16:15
                         ff["dt1600"] = (
-                            (ff["date"] + pd.Timedelta(hours=16, minutes=15) - ff["created_at"].dt.tz_convert("GB"))
+                            (
+                                ff["date"]
+                                + pd.Timedelta(hours=16, minutes=15)
+                                - ff["created_at"].dt.tz_convert("GB")
+                            )
                             .dt.total_seconds()
                             .abs()
                         )
@@ -302,7 +283,11 @@ class Command(BaseCommand):
                         df["dow"] = df.index.day_of_week
                         df["weekend"] = (df.index.day_of_week >= 5).astype(int)
                         df["time"] = df.index.tz_convert("GB").hour + df.index.minute / 60
-                        df["days_ago"] = (pd.Timestamp.now(tz="UTC") - df["created_at"]).dt.total_seconds() / 3600 / 24
+                        df["days_ago"] = (
+                            (pd.Timestamp.now(tz="UTC") - df["created_at"]).dt.total_seconds()
+                            / 3600
+                            / 24
+                        )
                         df["dt"] = (df.index - df["created_at"]).dt.total_seconds() / 3600 / 24
                         df["peak"] = ((df["time"] >= 16) & (df["time"] < 19)).astype(float)
 
@@ -335,17 +320,22 @@ class Command(BaseCommand):
 
                         # Only train on the next agile prices that are set from the pm auction
                         train_X = train_X[
-                            (train_X.index >= train_X["ag_start"]) & (train_X.index < train_X["ag_end"])
+                            (train_X.index >= train_X["ag_start"])
+                            & (train_X.index < train_X["ag_end"])
                         ][features]
 
                         # Get the prices to match the forecast
-                        train_X = train_X.merge(prices["day_ahead"], left_index=True, right_index=True)
+                        train_X = train_X.merge(
+                            prices["day_ahead"], left_index=True, right_index=True
+                        )
 
                         if debug:
                             logger.info(f"train_X:\n{train_X}")
 
                         train_y = train_X.pop("day_ahead")
-                        sample_weights = ((np.log10((train_y - train_y.mean()).abs() + 10) * 5) - 4).round(0)
+                        sample_weights = (
+                            (np.log10((train_y - train_y.mean()).abs() + 10) * 5) - 4
+                        ).round(0)
 
                         xg_model = xg.XGBRegressor(
                             objective="reg:squarederror",
@@ -364,12 +354,19 @@ class Command(BaseCommand):
                         n_cv = min(5, len(train_X) // 2)
                         if n_cv >= 2:
                             scores = cross_val_score(
-                                xg_model, train_X, train_y, cv=n_cv, scoring="neg_root_mean_squared_error"
+                                xg_model,
+                                train_X,
+                                train_y,
+                                cv=n_cv,
+                                scoring="neg_root_mean_squared_error",
                             )
                             logger.info(f"Cross-val scrore: {scores}")
                         else:
                             scores = np.array([0.0])
-                            logger.info("Too few training samples for cross-validation (n=%d) — skipping cv", len(train_X))
+                            logger.info(
+                                "Too few training samples for cross-validation (n=%d) — skipping cv",
+                                len(train_X),
+                            )
 
                         xg_model.fit(train_X, train_y, sample_weight=sample_weights, verbose=True)
 
@@ -382,7 +379,9 @@ class Command(BaseCommand):
                         # Drop the old data
                         test_X = test_X[test_X["days_ago"] < max_days]
 
-                        test_X = test_X.merge(prices["day_ahead"], left_index=True, right_index=True)
+                        test_X = test_X.merge(
+                            prices["day_ahead"], left_index=True, right_index=True
+                        )
                         test_y = test_X["day_ahead"]
 
                         if len(test_X) > MAX_TEST_X:
@@ -445,7 +444,9 @@ class Command(BaseCommand):
                             ]
                         )
 
-                        ax.plot(ff["created_at"], ff["mean"] * factor, lw=2, color="black", marker="o")
+                        ax.plot(
+                            ff["created_at"], ff["mean"] * factor, lw=2, color="black", marker="o"
+                        )
                         ax.fill_between(
                             ff["created_at"],
                             (ff["mean"] - ff["stdev"]) * factor,
@@ -475,7 +476,12 @@ class Command(BaseCommand):
                         fig, ax = plt.subplots(figsize=(16, 6))
 
                         subset = results[results["next_agile"]].sort_values("target_time")
-                        ax.plot(subset["target_time"], subset["day_ahead"], label="Actual", color="black")
+                        ax.plot(
+                            subset["target_time"],
+                            subset["day_ahead"],
+                            label="Actual",
+                            color="black",
+                        )
                         ax.plot(
                             subset["target_time"],
                             subset["pred"],
@@ -514,7 +520,11 @@ class Command(BaseCommand):
                         # 2. Prediction vs Actual Scatter
                         fig, ax = plt.subplots(figsize=(8, 6))
                         sc = ax.scatter(
-                            results["day_ahead"], results["pred"], alpha=0.2, c=results["dt"], cmap="plasma"
+                            results["day_ahead"],
+                            results["pred"],
+                            alpha=0.2,
+                            c=results["dt"],
+                            cmap="plasma",
                         )
                         cbar = fig.colorbar(sc, ax=ax)
                         cbar.set_label("Days Ahead (dt)")
@@ -568,7 +578,9 @@ class Command(BaseCommand):
 
                         # 5. Feature Importance (XGBoost built-in)
                         fig, ax = plt.subplots(figsize=(8, 6))
-                        xg.plot_importance(xg_model, ax=ax, importance_type="gain", show_values=False)
+                        xg.plot_importance(
+                            xg_model, ax=ax, importance_type="gain", show_values=False
+                        )
                         ax.set_title("XGBoost Feature Importance (Gain)")
                         save_plot(fig, "5_feature_importance")
 
@@ -605,10 +617,10 @@ class Command(BaseCommand):
                             # Graduated quantile regression: tighter bands near-term,
                             # wider far-term for consistent ~5% exceedance per horizon
                             qr_schedule = [
-                                (-2, 2, 0.12, 0.88),   # days 0-2: tight
-                                (2, 4, 0.08, 0.92),    # days 2-4: medium
-                                (4, 7, 0.05, 0.95),    # days 4-7: wider
-                                (7, 15, 0.03, 0.97),   # days 7-14: widest
+                                (-2, 2, 0.12, 0.88),  # days 0-2: tight
+                                (2, 4, 0.08, 0.92),  # days 2-4: medium
+                                (4, 7, 0.05, 0.95),  # days 4-7: wider
+                                (7, 15, 0.03, 0.97),  # days 7-14: widest
                             ]
 
                             # Train quantile models (reuse same training data)
@@ -633,9 +645,19 @@ class Command(BaseCommand):
                                     qr_params_hi["quantile_alpha"] = q_hi
 
                                     m_lo = xg.XGBRegressor(**qr_params_lo)
-                                    m_lo.fit(train_X, train_y, sample_weight=sample_weights, verbose=False)
+                                    m_lo.fit(
+                                        train_X,
+                                        train_y,
+                                        sample_weight=sample_weights,
+                                        verbose=False,
+                                    )
                                     m_hi = xg.XGBRegressor(**qr_params_hi)
-                                    m_hi.fit(train_X, train_y, sample_weight=sample_weights, verbose=False)
+                                    m_hi.fit(
+                                        train_X,
+                                        train_y,
+                                        sample_weight=sample_weights,
+                                        verbose=False,
+                                    )
                                     qr_models[(q_lo, q_hi)] = (
                                         m_lo.predict(fc_pred_input),
                                         m_hi.predict(fc_pred_input),
@@ -683,7 +705,8 @@ class Command(BaseCommand):
 
                     sfs = [
                         pd.DataFrame(
-                            index=pd.date_range(fc.index[0], agile_end, freq="30min"), data={"mult": 0, "shift": 1}
+                            index=pd.date_range(fc.index[0], agile_end, freq="30min"),
+                            data={"mult": 0, "shift": 1},
                         )
                     ]
 
@@ -701,7 +724,12 @@ class Command(BaseCommand):
                             )
                         )
                     else:
-                        sfs.append(pd.DataFrame(index=fc.index.difference(sfs[0].index), data={"mult": 1, "shift": 0}))
+                        sfs.append(
+                            pd.DataFrame(
+                                index=fc.index.difference(sfs[0].index),
+                                data={"mult": 1, "shift": 0},
+                            )
+                        )
 
                     fc = fc.astype(float)
                     scale_factors = pd.concat(sfs)
@@ -712,14 +740,16 @@ class Command(BaseCommand):
                                 logger.info(f"idx{i}: {sf.index[0]}:{sf.index[-1]}\n{sf}")
                         logger.info(f"Scale factors\n{scale_factors}")
 
-                    scale_factors = pd.concat([scale_factors, prices.reindex(scale_factors.index).fillna(0)], axis=1)
+                    scale_factors = pd.concat(
+                        [scale_factors, prices.reindex(scale_factors.index).fillna(0)], axis=1
+                    )
 
                     if debug:
                         logger.info(f"Scale Factors:\n{scale_factors}")
 
-                    fc["day_ahead"] = fc["day_ahead"] * scale_factors["mult"] + scale_factors["day_ahead"] * (
-                        1 - scale_factors["mult"]
-                    )
+                    fc["day_ahead"] = fc["day_ahead"] * scale_factors["mult"] + scale_factors[
+                        "day_ahead"
+                    ] * (1 - scale_factors["mult"])
                     fc["day_ahead_low"] = (
                         fc["day_ahead_low"] * scale_factors["mult"]
                         + scale_factors["day_ahead"] * (1 - scale_factors["mult"])
@@ -733,7 +763,13 @@ class Command(BaseCommand):
 
                     if debug:
                         logger.info(
-                            pd.concat([scale_factors, fc[["day_ahead", "day_ahead_low", "day_ahead_high"]]], axis=1)
+                            pd.concat(
+                                [
+                                    scale_factors,
+                                    fc[["day_ahead", "day_ahead_low", "day_ahead_high"]],
+                                ],
+                                axis=1,
+                            )
                         )
 
                     ag = pd.concat(
@@ -745,10 +781,14 @@ class Command(BaseCommand):
                                     "agile_pred": day_ahead_to_agile(fc["day_ahead"], region=region)
                                     .astype(float)
                                     .round(2),
-                                    "agile_low": day_ahead_to_agile(fc["day_ahead_low"], region=region)
+                                    "agile_low": day_ahead_to_agile(
+                                        fc["day_ahead_low"], region=region
+                                    )
                                     .astype(float)
                                     .round(2),
-                                    "agile_high": day_ahead_to_agile(fc["day_ahead_high"], region=region)
+                                    "agile_high": day_ahead_to_agile(
+                                        fc["day_ahead_high"], region=region
+                                    )
                                     .astype(float)
                                     .round(2),
                                 },
@@ -777,6 +817,17 @@ class Command(BaseCommand):
 
                     mean_score = -np.mean(scores) if len(scores) > 0 else 0.0
                     stdev_score = np.std(scores) if len(scores) > 0 else 0.0
+                    # Drop rows with NaN predictions (slots beyond forecast data range
+                    # where scale factor alignment produces NaN)
+                    nan_count = (
+                        ag[["agile_pred", "agile_low", "agile_high"]].isna().any(axis=1).sum()
+                    )
+                    if nan_count > 0:
+                        logger.warning(
+                            "Dropping %d/%d AgileData rows with NaN predictions", nan_count, len(ag)
+                        )
+                    ag = ag.dropna(subset=["agile_pred", "agile_low", "agile_high"])
+
                     this_forecast = Forecasts(name=new_name, mean=mean_score, stdev=stdev_score)
                     this_forecast.save()
                     fc["forecast"] = this_forecast
@@ -792,3 +843,105 @@ class Command(BaseCommand):
                 logger.info(f"\n\nAdded Forecast: {this_forecast.id:>4d}: {this_forecast.name}")
             except:
                 logger.info("No forecast added")
+
+        # --- Smart cleanup: runs AFTER prediction+save ---
+        # Strategy: preserve all training data, minimise storage growth
+        #
+        # Phase 1 — Dedup: keep 1 forecast per calendar day (closest to 16:15)
+        #           + always the newest.  Delete duplicates via CASCADE
+        #           (removes their ForecastData + AgileData).
+        #
+        # Phase 2 — AgileData trim: for kept forecasts older than
+        #           AGILE_DATA_RETENTION_DAYS, delete AgileData only.
+        #           Keeps ForecastData (needed for training) and the
+        #           Forecast record itself.  StatsView error heatmap
+        #           needs AgileData from recent forecasts (~14 days).
+        #
+        # Never deleted: PriceHistory, ForecastData from kept forecasts.
+        # Growth: ~6 MB/year (FD ~5 MB + PH ~0.5 MB + AD capped ~3 MB).
+        AGILE_DATA_RETENTION_DAYS = 14
+
+        all_forecasts = Forecasts.objects.all().order_by("-created_at")
+        if all_forecasts.exists():
+            keep_ids = set()
+
+            # Always keep the forecast just created by this run
+            try:
+                keep_ids.add(this_forecast.id)
+            except NameError:
+                # this_forecast may not exist if prediction phase was skipped
+                keep_ids.add(all_forecasts.first().id)
+
+            # Pre-compute which forecasts have AgileData (real predictions)
+            ids_with_agile = set(AgileData.objects.values_list("forecast_id", flat=True).distinct())
+
+            # Keep best forecast per calendar day (no retention window — keep all days)
+            # Prefer real forecasts (with AgileData) over backfilled ones
+            daily_best = {}
+            for f in all_forecasts:
+                try:
+                    dt = pd.to_datetime(f.name).tz_localize("GB")
+                except (ValueError, TypeError):
+                    continue
+                date_key = dt.normalize()
+                has_agile = f.id in ids_with_agile
+                target_1615 = date_key + pd.Timedelta(hours=16, minutes=15)
+                distance = abs((dt - target_1615).total_seconds())
+                if date_key not in daily_best:
+                    daily_best[date_key] = (f.id, has_agile, distance)
+                else:
+                    _, prev_has_agile, prev_distance = daily_best[date_key]
+                    # Real forecast always wins over backfilled
+                    if has_agile and not prev_has_agile:
+                        daily_best[date_key] = (f.id, has_agile, distance)
+                    elif has_agile == prev_has_agile and distance < prev_distance:
+                        daily_best[date_key] = (f.id, has_agile, distance)
+
+            keep_ids.update(fid for fid, _, _ in daily_best.values())
+
+            # Phase 1: delete duplicate forecasts (CASCADE removes FD + AD)
+            to_delete = Forecasts.objects.exclude(id__in=keep_ids)
+            n_delete = to_delete.count()
+            if n_delete > 0:
+                if debug:
+                    for f in to_delete:
+                        fd_n = ForecastData.objects.filter(forecast=f).count()
+                        ad_n = AgileData.objects.filter(forecast=f).count()
+                        logger.info(f"  Deleting duplicate {f.id}: {f.name} (FD={fd_n}, AD={ad_n})")
+                to_delete.delete()
+                logger.info(
+                    "Cleanup phase 1: deleted %d duplicate forecasts, kept %d",
+                    n_delete,
+                    len(keep_ids),
+                )
+            elif debug:
+                logger.info("Cleanup phase 1: no duplicates (%d forecasts)", all_forecasts.count())
+
+            # Phase 2: trim AgileData from old kept forecasts
+            cutoff = pd.Timestamp.now(tz="GB") - pd.Timedelta(days=AGILE_DATA_RETENTION_DAYS)
+            old_forecast_ids = []
+            for f in Forecasts.objects.filter(id__in=keep_ids).exclude(id=all_forecasts.first().id):
+                try:
+                    dt = pd.to_datetime(f.name).tz_localize("GB")
+                except (ValueError, TypeError):
+                    continue
+                if dt < cutoff:
+                    old_forecast_ids.append(f.id)
+
+            if old_forecast_ids:
+                ad_to_delete = AgileData.objects.filter(forecast_id__in=old_forecast_ids)
+                ad_count = ad_to_delete.count()
+                if ad_count > 0:
+                    ad_to_delete.delete()
+                    logger.info(
+                        "Cleanup phase 2: deleted %d AgileData rows from %d forecasts older than %d days",
+                        ad_count,
+                        len(old_forecast_ids),
+                        AGILE_DATA_RETENTION_DAYS,
+                    )
+                elif debug:
+                    logger.info("Cleanup phase 2: no old AgileData to trim")
+            elif debug:
+                logger.info(
+                    "Cleanup phase 2: no forecasts older than %d days", AGILE_DATA_RETENTION_DAYS
+                )
