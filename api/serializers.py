@@ -25,6 +25,8 @@ class PriceForecastSerializer(serializers.ModelSerializer):
 class FilteredListSerializer(serializers.ListSerializer):
     def to_representation(self, data):
         data = data.filter(region=self.context["region"])
+        if not data.exists():
+            return []
         max_date = min([d.date_time for d in data.all()]) + pd.Timedelta(days=self.context["days"])
         data = data.filter(date_time__lte=max_date)
         return super(FilteredListSerializer, self).to_representation(data)
