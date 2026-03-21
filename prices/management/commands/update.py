@@ -852,14 +852,21 @@ class Command(BaseCommand):
         #           (removes their ForecastData + AgileData).
         #
         # Phase 2 — AgileData trim: for kept forecasts older than
-        #           AGILE_DATA_RETENTION_DAYS, delete AgileData only.
-        #           Keeps ForecastData (needed for training) and the
-        #           Forecast record itself.  StatsView error heatmap
-        #           needs AgileData from recent forecasts (~14 days).
+        #           AGILE_DATA_RETENTION_DAYS, delete AgileData for all
+        #           regions EXCEPT our local region (config: region).
+        #           Local region AgileData is kept forever to enable
+        #           ongoing prediction accuracy analysis (prediction vs
+        #           actual from PriceHistory).  ~18 MB/year, ~175 MB/10yr.
+        #           StatsView error heatmap also benefits from this.
         #
-        # Never deleted: PriceHistory, ForecastData from kept forecasts.
-        # Growth: ~6 MB/year (FD ~5 MB + PH ~0.5 MB + AD capped ~3 MB).
+        # Never deleted: PriceHistory, ForecastData, AgileData(local region).
+        # Growth: ~23 MB/year (FD ~5 MB + PH ~0.5 MB + AD(F) ~18 MB).
         AGILE_DATA_RETENTION_DAYS = 14
+        # Region whose AgileData is kept permanently for accuracy analysis.
+        # Matches the DNO region code used by run_agile_predict_update.py.
+        # Default "F" (East Midlands); override via AGILE_LOCAL_REGION env var.
+        import os as _os
+        local_region = _os.environ.get("AGILE_LOCAL_REGION", "F")
 
         all_forecasts = Forecasts.objects.all().order_by("-created_at")
         if all_forecasts.exists():
@@ -929,15 +936,21 @@ class Command(BaseCommand):
                     old_forecast_ids.append(f.id)
 
             if old_forecast_ids:
-                ad_to_delete = AgileData.objects.filter(forecast_id__in=old_forecast_ids)
+                # Delete non-local regions only; keep local region forever for accuracy analysis
+                ad_to_delete = AgileData.objects.filter(
+                    forecast_id__in=old_forecast_ids
+                ).exclude(region=local_region)
                 ad_count = ad_to_delete.count()
                 if ad_count > 0:
                     ad_to_delete.delete()
                     logger.info(
-                        "Cleanup phase 2: deleted %d AgileData rows from %d forecasts older than %d days",
+                        "Cleanup phase 2: deleted %d AgileData rows (non-%s regions) from %d"
+                        " forecasts older than %d days (region %s kept permanently)",
                         ad_count,
+                        local_region,
                         len(old_forecast_ids),
                         AGILE_DATA_RETENTION_DAYS,
+                        local_region,
                     )
                 elif debug:
                     logger.info("Cleanup phase 2: no old AgileData to trim")
