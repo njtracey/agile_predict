@@ -8,3 +8,5 @@ __pycache__/
 logs/
 static/
 plots/
+.DS_Store
+venv/
