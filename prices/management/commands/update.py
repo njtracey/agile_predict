@@ -130,7 +130,7 @@ class Command(BaseCommand):
 
         debug = options.get("debug", False)
 
-        max_days = int(options.get("max_days", 60) or 60)
+        max_days = int(options.get("max_days", 3650) or 3650)
 
         no_ranges = options.get("no_ranges", False)
 
@@ -333,9 +333,13 @@ class Command(BaseCommand):
                             logger.info(f"train_X:\n{train_X}")
 
                         train_y = train_X.pop("day_ahead")
+                        recency_weight = np.exp(
+                            -train_X["days_ago"].values * np.log(2) / 180
+                        )
                         sample_weights = (
-                            (np.log10((train_y - train_y.mean()).abs() + 10) * 5) - 4
-                        ).round(0)
+                            ((np.log10((train_y - train_y.mean()).abs() + 10) * 5) - 4)
+                            * recency_weight
+                        )
 
                         xg_model = xg.XGBRegressor(
                             objective="reg:squarederror",
@@ -351,16 +355,25 @@ class Command(BaseCommand):
                             reg_lambda=0.0095,
                         )
 
+                        MAX_CV_SAMPLES = 10_000
                         n_cv = min(5, len(train_X) // 2)
                         if n_cv >= 2:
+                            if len(train_X) > MAX_CV_SAMPLES:
+                                cv_idx = np.random.default_rng(42).choice(
+                                    len(train_X), MAX_CV_SAMPLES, replace=False
+                                )
+                                cv_X = train_X.iloc[cv_idx]
+                                cv_y = train_y.iloc[cv_idx]
+                            else:
+                                cv_X, cv_y = train_X, train_y
                             scores = cross_val_score(
                                 xg_model,
-                                train_X,
-                                train_y,
+                                cv_X,
+                                cv_y,
                                 cv=n_cv,
                                 scoring="neg_root_mean_squared_error",
                             )
-                            logger.info(f"Cross-val scrore: {scores}")
+                            logger.info(f"Cross-val score: {scores}")
                         else:
                             scores = np.array([0.0])
                             logger.info(
