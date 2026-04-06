@@ -330,6 +330,91 @@ def fetch_interconnector_flows(date_from, date_to):
     return df
 
 
+def fetch_derated_margin(date_from, date_to):
+    """Fetch half-hourly derated margin from Elexon BMRS MELNGC dataset.
+
+    Extracts national boundary (N) and nearest boundary (B1) margin values.
+    Iterates in 7-day chunks to stay within API limits.
+
+    Returns DataFrame with columns:
+        - derated_margin_mw: National boundary margin (MW)
+        - margin_nearest_mw: Nearest boundary (B1) margin (MW)
+    Indexed by UTC datetime. Returns empty DataFrame on failure.
+    """
+    n_rows = {}
+    b1_rows = {}
+    try:
+        start = pd.Timestamp(date_from).normalize()
+        end = pd.Timestamp(date_to).normalize()
+        logger.info("Elexon MELNGC derated margin: fetching %s to %s", date_from, date_to)
+
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + pd.Timedelta(days=6), end)
+            from_str = chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+            to_str = (chunk_end + pd.Timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url = "https://data.elexon.co.uk/bmrs/api/v1/datasets/MELNGC"
+            params = {
+                "from": from_str,
+                "to": to_str,
+                "format": "json",
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=60)
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+                logger.info(
+                    "Elexon MELNGC: chunk %s→%s: %d records",
+                    from_str[:10], to_str[:10], len(data),
+                )
+
+                for record in data:
+                    boundary = record.get("boundary")
+                    margin = record.get("margin")
+                    settlement_date = record.get("settlementDate")
+                    settlement_period = record.get("settlementPeriod")
+                    if settlement_date and settlement_period is not None and margin is not None:
+                        dt = pd.Timestamp(settlement_date) + (int(settlement_period) - 1) * pd.Timedelta("30min")
+                        dt = dt.tz_localize("UTC")
+                        if boundary == "N":
+                            n_rows[dt] = float(margin)
+                        elif boundary == "B1":
+                            b1_rows[dt] = float(margin)
+            except Exception as e:
+                logger.warning(
+                    "Elexon MELNGC: failed for chunk %s to %s: %s",
+                    from_str, to_str, e,
+                )
+
+            chunk_start = chunk_end + pd.Timedelta(days=1)
+
+    except Exception as e:
+        logger.warning("Elexon MELNGC derated margin: fetch failed: %s", e)
+        return pd.DataFrame()
+
+    if not n_rows and not b1_rows:
+        logger.warning("Elexon MELNGC: no margin data found for %s to %s", date_from, date_to)
+        return pd.DataFrame()
+
+    # Build DataFrame with both columns
+    all_dts = sorted(set(list(n_rows.keys()) + list(b1_rows.keys())))
+    rows = []
+    for dt in all_dts:
+        rows.append({
+            "datetime": dt,
+            "derated_margin_mw": n_rows.get(dt, float("nan")),
+            "margin_nearest_mw": b1_rows.get(dt, float("nan")),
+        })
+
+    df = pd.DataFrame(rows).set_index("datetime").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    logger.info(
+        "Elexon MELNGC derated margin: fetched %d records (%s to %s)",
+        len(df), df.index[0], df.index[-1],
+    )
+    return df
+
+
 def fetch_day_ahead_auction(date_from, date_to):
     """Fetch EPEX day-ahead auction prices from Elexon MID dataset.
 

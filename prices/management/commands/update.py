@@ -2,8 +2,9 @@ import xgboost as xg
 import lightgbm as lgb
 from pathlib import Path
 from sklearn.metrics import mean_squared_error as MSE
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, cross_val_predict
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import Ridge
 
 import matplotlib
 
@@ -136,6 +137,20 @@ class Command(BaseCommand):
             type=int,
             default=60,
             help="Short training window in days when high volatility detected (default: 60)",
+        )
+
+        parser.add_argument(
+            "--spike_threshold",
+            type=float,
+            default=2000,
+            help="Derated margin threshold MW below which spike risk is high (default: 2000)",
+        )
+
+        parser.add_argument(
+            "--comfortable_margin",
+            type=float,
+            default=4000,
+            help="Derated margin MW above which spike weight is 0 (default: 4000)",
         )
 
         # --bootstrap removed: new smart cleanup strategy is inherently safe for cold start
@@ -326,6 +341,7 @@ class Command(BaseCommand):
                     scores = []  # initialise so line 707 ref is safe if training block is skipped (e.g. first run)
                     elexon_features_available = False  # track whether Elexon API data was fetched successfully
                     interconnector_available = False  # track whether interconnector API data was fetched successfully
+                    margin_available = False  # track whether derated margin API data was fetched successfully
                     conformal_offsets = {}  # conformal prediction offsets per horizon (Req 10)
                     cal_coverage_rate = None  # conformal calibration coverage rate (Req 10)
 
@@ -390,6 +406,12 @@ class Command(BaseCommand):
 
                         lag_features = pd.DataFrame(index=price_series.index)
                         lag_features["price_lag_1"] = price_series.shift(1)
+                        lag_features["price_lag_2"] = price_series.shift(2)
+                        lag_features["price_lag_3"] = price_series.shift(3)
+                        lag_features["price_lag_4"] = price_series.shift(4)
+                        lag_features["price_lag_6"] = price_series.shift(6)
+                        lag_features["price_lag_12"] = price_series.shift(12)
+                        lag_features["price_lag_24"] = price_series.shift(24)
                         lag_features["price_lag_48"] = price_series.shift(48)
                         lag_features["price_lag_336"] = price_series.shift(336)
                         lag_features["price_rolling_mean_48"] = price_series.rolling(48).mean()
@@ -412,6 +434,13 @@ class Command(BaseCommand):
 
                         # --- Residual demand feature ---
                         df["residual_demand"] = df["demand"] - df["bm_wind"] - df["solar"]
+
+                        # --- Renewable penetration feature (Req 3 - Round 2) ---
+                        df["renewable_penetration"] = np.where(
+                            df["demand"] > 0,
+                            (df["bm_wind"] + df["solar"]) / df["demand"] * 100,
+                            0.0,
+                        )
 
                         # --- Commodity price features (Req 2) ---
                         df["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
@@ -464,6 +493,24 @@ class Command(BaseCommand):
                         else:
                             logger.warning("Interconnector feature: API returned empty data, omitting from this run")
 
+                        # --- Derated margin (Req 1 - Round 2) ---
+                        margin_df = fetch_derated_margin(elexon_from, elexon_to)
+                        margin_available = False
+
+                        if len(margin_df) > 0:
+                            df["derated_margin_mw"] = margin_df["derated_margin_mw"].reindex(df.index).ffill().bfill()
+                            df["margin_nearest_mw"] = margin_df["margin_nearest_mw"].reindex(df.index).ffill().bfill()
+                            if df["derated_margin_mw"].notna().sum() > 0:
+                                df["derated_margin_mw"] = df["derated_margin_mw"].fillna(0.0)
+                                df["margin_nearest_mw"] = df["margin_nearest_mw"].fillna(0.0)
+                                margin_available = True
+                                logger.info("Derated margin features: derated_margin_mw, margin_nearest_mw added to training data")
+                            else:
+                                df.drop(columns=["derated_margin_mw", "margin_nearest_mw"], inplace=True, errors="ignore")
+                                logger.warning("Derated margin features: insufficient data after merge, omitting from this run")
+                        else:
+                            logger.warning("Derated margin features: API returned empty data, omitting from this run")
+
                         features = [
                             "bm_wind",
                             "solar",
@@ -476,8 +523,14 @@ class Command(BaseCommand):
                             "hour_cos",
                             "month_sin",
                             "month_cos",
-                            # Lag price features (Req 1)
+                            # Lag price features (Req 1 + Req 2 Round 2)
                             "price_lag_1",
+                            "price_lag_2",
+                            "price_lag_3",
+                            "price_lag_4",
+                            "price_lag_6",
+                            "price_lag_12",
+                            "price_lag_24",
                             "price_lag_48",
                             "price_lag_336",
                             "price_rolling_mean_48",
@@ -486,6 +539,8 @@ class Command(BaseCommand):
                             "price_volatility_30d",
                             # Residual demand (Req 8)
                             "residual_demand",
+                            # Renewable penetration (Req 3 Round 2)
+                            "renewable_penetration",
                             # Commodity prices (Req 2)
                             "gas_price_ptherm",
                             "carbon_price_eur",
@@ -502,6 +557,10 @@ class Command(BaseCommand):
                         # Conditionally add interconnector feature (Req 3)
                         if interconnector_available:
                             features.append("net_interconnector_mw")
+
+                        # Conditionally add derated margin features (Req 1 - Round 2)
+                        if margin_available:
+                            features.extend(["derated_margin_mw", "margin_nearest_mw"])
 
                         # Only use the forecasts closest to 16:15 for training
                         train_X = df[df["forecast_id"].isin(ff_train.index)]
@@ -612,14 +671,61 @@ class Command(BaseCommand):
                             # Ensemble scores for the Forecasts model mean/stdev
                             scores = xg_weight * xg_scores + lgb_weight * lgb_scores
                             logger.info(f"Ensemble cross-val score: {scores}")
+
+                            # --- Stacking Meta-Model (Req 5 - Round 2) ---
+                            # Task 7.1: Ridge base model + out-of-fold predictions
+                            ridge_model = Ridge(alpha=1.0)
+                            meta_learner_available = False
+
+                            try:
+                                oof_xg = cross_val_predict(xg_model, cv_X, cv_y, cv=n_cv)
+                                oof_lgb = cross_val_predict(lgb_model, cv_X, cv_y, cv=n_cv)
+                                oof_ridge = cross_val_predict(ridge_model, cv_X, cv_y, cv=n_cv)
+                                logger.info(
+                                    "Out-of-fold predictions: XGBoost=%d, LightGBM=%d, Ridge=%d samples",
+                                    len(oof_xg), len(oof_lgb), len(oof_ridge),
+                                )
+
+                                # Task 7.2: Train Ridge meta-learner on stacked OOF predictions
+                                meta_X = np.column_stack([oof_xg, oof_lgb, oof_ridge])
+                                meta_learner = Ridge(alpha=0.1, fit_intercept=True)
+                                meta_learner.fit(meta_X, cv_y)
+                                logger.info(
+                                    "Meta-learner coefficients: XGBoost=%.3f, LightGBM=%.3f, Ridge=%.3f, intercept=%.3f",
+                                    meta_learner.coef_[0], meta_learner.coef_[1], meta_learner.coef_[2],
+                                    meta_learner.intercept_,
+                                )
+
+                                # Update ensemble scores to reflect meta-learner performance
+                                meta_oof_pred = meta_learner.predict(meta_X)
+                                meta_rmse = np.sqrt(MSE(cv_y, meta_oof_pred))
+                                logger.info("Meta-learner OOF RMSE: %.3f", meta_rmse)
+                                # Preserve original ensemble scores for stdev, but scale mean to meta-learner RMSE
+                                original_mean = abs(scores.mean())
+                                if original_mean > 0:
+                                    scores = scores * (meta_rmse / original_mean)
+
+                                meta_learner_available = True
+                                logger.info("Stacking meta-learner: ACTIVE (replacing inverse-RMSE for combined model)")
+
+                            except Exception as e:
+                                # Task 7.4: Fallback to inverse-RMSE ensemble
+                                logger.warning(
+                                    "Stacking meta-learner: cross_val_predict failed (%s), "
+                                    "falling back to inverse-RMSE ensemble",
+                                    e,
+                                )
+                                meta_learner_available = False
                         else:
                             xg_scores = np.array([0.0])
                             lgb_scores = np.array([0.0])
                             xg_weight = 0.5
                             lgb_weight = 0.5
                             scores = np.array([0.0])
+                            ridge_model = Ridge(alpha=1.0)
+                            meta_learner_available = False
                             logger.info(
-                                "Too few training samples for cross-validation (n=%d) — skipping cv",
+                                "Too few training samples for cross-validation (n=%d) — skipping cv and meta-learner",
                                 len(train_X),
                             )
 
@@ -760,6 +866,8 @@ class Command(BaseCommand):
                         # Train final models on FULL training data for actual predictions
                         xg_model.fit(train_X, train_y, sample_weight=sample_weights, verbose=True)
                         lgb_model.fit(train_X, train_y, sample_weight=sample_weights)
+                        # Task 7.3: Retrain Ridge on full data (XGBoost/LightGBM already retrained above)
+                        ridge_model.fit(train_X, train_y)
 
                         # --- Horizon-specific models (Req 5) ---
                         HORIZON_CONFIGS = [
@@ -854,6 +962,83 @@ class Command(BaseCommand):
                                 )
                                 horizon_models[hcfg["name"]] = (xg_model, lgb_model, xg_weight, lgb_weight)
 
+                        # --- Regime-aware spike model (Req 7 - Round 2) ---
+                        spike_model_available = False
+                        if margin_available:
+                            spike_threshold = float(options.get("spike_threshold", 2000) or 2000)
+                            comfortable_margin = float(options.get("comfortable_margin", 4000) or 4000)
+
+                            spike_mask = train_X["derated_margin_mw"] < spike_threshold
+                            spike_count = spike_mask.sum()
+
+                            if spike_count >= 50:
+                                spike_train_X = train_X[spike_mask]
+                                spike_train_y = train_y[spike_mask]
+                                spike_weights = sample_weights[spike_mask]
+
+                                # Train separate XGBoost + LightGBM on low-margin data
+                                spike_xg = xg.XGBRegressor(
+                                    objective="reg:squarederror",
+                                    booster="gbtree",
+                                    learning_rate=0.0135,
+                                    max_depth=8,
+                                    subsample=0.775,
+                                    colsample_bytree=0.604,
+                                    n_estimators=150,
+                                    gamma=0.093,
+                                    min_child_weight=4,
+                                    reg_alpha=0.003,
+                                    reg_lambda=0.0095,
+                                )
+                                spike_lgb = lgb.LGBMRegressor(
+                                    objective="regression",
+                                    learning_rate=0.015,
+                                    max_depth=8,
+                                    subsample=0.8,
+                                    colsample_bytree=0.6,
+                                    n_estimators=150,
+                                    min_child_weight=4,
+                                    reg_alpha=0.003,
+                                    reg_lambda=0.01,
+                                    verbose=-1,
+                                )
+
+                                # CV for spike ensemble weights
+                                spike_n_cv = min(5, len(spike_train_X) // 2)
+                                if spike_n_cv >= 2:
+                                    spike_xg_scores = cross_val_score(
+                                        spike_xg, spike_train_X, spike_train_y,
+                                        cv=spike_n_cv, scoring="neg_root_mean_squared_error",
+                                    )
+                                    spike_lgb_scores = cross_val_score(
+                                        spike_lgb, spike_train_X, spike_train_y,
+                                        cv=spike_n_cv, scoring="neg_root_mean_squared_error",
+                                    )
+                                    spike_xg_w = 1.0 / abs(spike_xg_scores.mean())
+                                    spike_lgb_w = 1.0 / abs(spike_lgb_scores.mean())
+                                    spike_total_w = spike_xg_w + spike_lgb_w
+                                    spike_xg_w /= spike_total_w
+                                    spike_lgb_w /= spike_total_w
+                                else:
+                                    spike_xg_w = 0.5
+                                    spike_lgb_w = 0.5
+
+                                spike_xg.fit(spike_train_X, spike_train_y, sample_weight=spike_weights, verbose=False)
+                                spike_lgb.fit(spike_train_X, spike_train_y, sample_weight=spike_weights)
+
+                                spike_model_available = True
+                                logger.info(
+                                    "Spike model: trained on %d low-margin samples (threshold=%d MW, weights: XG=%.3f, LGB=%.3f)",
+                                    spike_count, spike_threshold, spike_xg_w, spike_lgb_w,
+                                )
+                            else:
+                                logger.warning(
+                                    "Spike model: only %d samples below threshold %d MW, skipping",
+                                    spike_count, spike_threshold,
+                                )
+                        else:
+                            logger.info("Spike model: skipped (derated margin data unavailable)")
+
                         # Drop the training data set
                         test_X = df[~df["forecast_id"].isin(ff_train.index)]
 
@@ -895,7 +1080,14 @@ class Command(BaseCommand):
                         results = test_X[["dt", "day_ahead"]].copy()
                         xg_test_pred = xg_model.predict(test_X[features])
                         lgb_test_pred = lgb_model.predict(test_X[features])
-                        results["pred"] = xg_weight * xg_test_pred + lgb_weight * lgb_test_pred
+
+                        # Task 7.3: Use meta-learner for test set evaluation when available
+                        if meta_learner_available:
+                            ridge_test_pred = ridge_model.predict(test_X[features].fillna(0.0))
+                            test_meta_X = np.column_stack([xg_test_pred, lgb_test_pred, ridge_test_pred])
+                            results["pred"] = meta_learner.predict(test_meta_X)
+                        else:
+                            results["pred"] = xg_weight * xg_test_pred + lgb_weight * lgb_test_pred
 
                         # Log individual and ensemble RMSE on test set (Req 4)
                         xg_test_rmse = np.sqrt(MSE(test_X["day_ahead"], xg_test_pred))
@@ -1148,11 +1340,11 @@ class Command(BaseCommand):
 
                     if len(ff) > 0:
                         # lag_features was computed in the training block above
-                        for col in ["price_lag_1", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
+                        for col in ["price_lag_1", "price_lag_2", "price_lag_3", "price_lag_4", "price_lag_6", "price_lag_12", "price_lag_24", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
                             latest_val = lag_features[col].dropna().iloc[-1] if len(lag_features[col].dropna()) > 0 else fc_price_mean
                             fc[col] = latest_val
                     else:
-                        for col in ["price_lag_1", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
+                        for col in ["price_lag_1", "price_lag_2", "price_lag_3", "price_lag_4", "price_lag_6", "price_lag_12", "price_lag_24", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
                             fc[col] = fc_price_mean
 
                     # --- Price volatility features for prediction data ---
@@ -1163,6 +1355,13 @@ class Command(BaseCommand):
 
                     # --- Residual demand for prediction data ---
                     fc["residual_demand"] = fc["demand"] - fc["bm_wind"] - fc["solar"]
+
+                    # --- Renewable penetration for prediction data (Req 3 - Round 2) ---
+                    fc["renewable_penetration"] = np.where(
+                        fc["demand"] > 0,
+                        (fc["bm_wind"] + fc["solar"]) / fc["demand"] * 100,
+                        0.0,
+                    )
 
                     # --- Commodity price features for prediction data (Req 2) ---
                     fc["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
@@ -1194,6 +1393,18 @@ class Command(BaseCommand):
                             latest_interconnector,
                         )
 
+                    # --- Derated margin features for prediction data (Req 1 - Round 2) ---
+                    # Forward-fill from the latest known margin values
+                    if len(ff) > 0 and margin_available:
+                        latest_margin = df["derated_margin_mw"].dropna().iloc[-1] if len(df["derated_margin_mw"].dropna()) > 0 else 0.0
+                        latest_nearest = df["margin_nearest_mw"].dropna().iloc[-1] if len(df["margin_nearest_mw"].dropna()) > 0 else 0.0
+                        fc["derated_margin_mw"] = latest_margin
+                        fc["margin_nearest_mw"] = latest_nearest
+                        logger.info(
+                            "Derated margin prediction features: derated_margin_mw=%.0f, margin_nearest_mw=%.0f (forward-filled)",
+                            latest_margin, latest_nearest,
+                        )
+
                     if len(ff) > 0:
                         fc_pred_input = fc.drop("emb_wind", axis=1).reindex(train_X.columns, axis=1)
 
@@ -1213,7 +1424,20 @@ class Command(BaseCommand):
 
                             h_xg, h_lgb, h_xg_w, h_lgb_w = horizon_models[h_name]
                             row_input = fc_pred_input.iloc[[i]]
-                            fc_day_ahead[i] = h_xg_w * h_xg.predict(row_input)[0] + h_lgb_w * h_lgb.predict(row_input)[0]
+
+                            # Task 7.3: Use meta-learner for combined (fallback) model slots
+                            if meta_learner_available and h_xg is xg_model:
+                                # This horizon fell back to the combined model — use meta-learner
+                                xg_p = h_xg.predict(row_input)[0]
+                                lgb_p = h_lgb.predict(row_input)[0]
+                                # Ridge requires NaN-free input
+                                ridge_input = row_input.fillna(0.0)
+                                ridge_p = ridge_model.predict(ridge_input)[0]
+                                pred_stack = np.array([[xg_p, lgb_p, ridge_p]])
+                                fc_day_ahead[i] = meta_learner.predict(pred_stack)[0]
+                            else:
+                                # Per-horizon model with its own inverse-RMSE weights
+                                fc_day_ahead[i] = h_xg_w * h_xg.predict(row_input)[0] + h_lgb_w * h_lgb.predict(row_input)[0]
                             horizon_slot_counts[h_name] += 1
 
                         fc["day_ahead"] = fc_day_ahead
@@ -1223,6 +1447,26 @@ class Command(BaseCommand):
                             horizon_slot_counts["medium"],
                             horizon_slot_counts["far"],
                         )
+
+                        # --- Spike weight blending (Req 7 - Round 2) ---
+                        if spike_model_available:
+                            spike_weight = np.clip(
+                                1.0 - fc["derated_margin_mw"].values / comfortable_margin, 0.0, 1.0
+                            )
+
+                            spike_xg_pred = spike_xg.predict(fc_pred_input)
+                            spike_lgb_pred = spike_lgb.predict(fc_pred_input)
+                            spike_pred = spike_xg_w * spike_xg_pred + spike_lgb_w * spike_lgb_pred
+
+                            normal_pred = fc["day_ahead"].values
+                            fc["day_ahead"] = (1 - spike_weight) * normal_pred + spike_weight * spike_pred
+
+                            n_blended = (spike_weight > 0).sum()
+                            mean_spike_w = spike_weight[spike_weight > 0].mean() if n_blended > 0 else 0.0
+                            logger.info(
+                                "Spike blending: %d/%d slots blended, mean spike_weight=%.3f",
+                                n_blended, len(fc), mean_spike_w,
+                            )
 
                         if (len(test_X) > 10) and (not no_ranges):
                             # Graduated quantile regression: tighter bands near-term,
