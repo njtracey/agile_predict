@@ -30,6 +30,19 @@ class AgileData(models.Model):
         return reverse("graph", kwargs={"region": self.region})
 
 
+class OfficialAgileData(models.Model):
+    """Predictions from the official agilepredict.com API, stored for comparison."""
+
+    forecast = models.ForeignKey(Forecasts, related_name="official_prices", on_delete=models.CASCADE)
+    date_time = models.DateTimeField()
+    agile_pred = models.FloatField()
+    agile_low = models.FloatField()
+    agile_high = models.FloatField()
+
+    class Meta:
+        unique_together = ("forecast", "date_time")
+
+
 class History(models.Model):
     date_time = models.DateTimeField(unique=True)
     total_wind = models.FloatField()

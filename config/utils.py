@@ -1,3 +1,6 @@
+import json
+import os
+
 import pandas as pd
 import requests
 import time
@@ -29,6 +32,354 @@ RETRY_CODES = [
 ]
 
 regions = GLOBAL_SETTINGS["REGIONS"]
+
+# OilPriceAPI key for gas and carbon price fetching (repo is not public)
+OILPRICE_API_KEY = "09287899c129971df72aa7166ab8243649c5dbbb04eadd292fa5c3a1d5c29b5c"
+
+# Default commodity prices used when API and cache are both unavailable
+DEFAULT_GAS_PRICE_PTHERM = 80.0
+DEFAULT_CARBON_PRICE_EUR = 70.0
+
+
+def fetch_commodity_prices(cache_path="cache/commodity_prices.json"):
+    """Fetch daily gas and carbon prices from OilPriceAPI, with caching.
+
+    Returns dict with 'gas_price_ptherm' and 'carbon_price_eur'.
+    Uses cache if less than 24 hours old to conserve API quota (50 req/month).
+    Fetches both in a single request: by_code=NATURAL_GAS_GBP,EU_CARBON_EUR
+    """
+    defaults = {
+        "gas_price_ptherm": DEFAULT_GAS_PRICE_PTHERM,
+        "carbon_price_eur": DEFAULT_CARBON_PRICE_EUR,
+    }
+
+    # Ensure cache directory exists
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    # Check cache freshness
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            last_updated = pd.Timestamp(cached["last_updated"])
+            age_hours = (pd.Timestamp.now(tz="UTC") - last_updated).total_seconds() / 3600
+            if age_hours < 24:
+                logger.info("Commodity prices: using cache (%.1f hours old)", age_hours)
+                return {
+                    "gas_price_ptherm": cached["gas_price_ptherm"],
+                    "carbon_price_eur": cached["carbon_price_eur"],
+                }
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("Commodity prices: cache read error: %s", e)
+
+    # Fetch from API
+    url = "https://api.oilpriceapi.com/v1/prices/latest"
+    params = {"by_code": "NATURAL_GAS_GBP,EU_CARBON_EUR"}
+    headers = {"Authorization": f"Token {OILPRICE_API_KEY}"}
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Parse response — API returns a dict with 'data' containing 'prices' list
+        prices_data = data.get("data", {}).get("prices", [])
+        result = {}
+        for item in prices_data:
+            code = item.get("code", "")
+            price = item.get("price")
+            if code == "NATURAL_GAS_GBP" and price is not None:
+                result["gas_price_ptherm"] = float(price)
+            elif code == "EU_CARBON_EUR" and price is not None:
+                result["carbon_price_eur"] = float(price)
+
+        if "gas_price_ptherm" not in result or "carbon_price_eur" not in result:
+            logger.warning("Commodity prices: API response missing expected price codes, data: %s", data)
+            # Fill in any missing values from cache or defaults
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r") as f:
+                        cached = json.load(f)
+                    result.setdefault("gas_price_ptherm", cached.get("gas_price_ptherm", defaults["gas_price_ptherm"]))
+                    result.setdefault("carbon_price_eur", cached.get("carbon_price_eur", defaults["carbon_price_eur"]))
+                except (json.JSONDecodeError, KeyError):
+                    result.setdefault("gas_price_ptherm", defaults["gas_price_ptherm"])
+                    result.setdefault("carbon_price_eur", defaults["carbon_price_eur"])
+            else:
+                result.setdefault("gas_price_ptherm", defaults["gas_price_ptherm"])
+                result.setdefault("carbon_price_eur", defaults["carbon_price_eur"])
+
+        # Write to cache
+        cache_data = {
+            "last_updated": pd.Timestamp.now(tz="UTC").isoformat(),
+            "gas_price_ptherm": result["gas_price_ptherm"],
+            "carbon_price_eur": result["carbon_price_eur"],
+        }
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+
+        logger.info(
+            "Commodity prices: fetched gas=%.2f p/therm, carbon=%.2f EUR/tonne",
+            result["gas_price_ptherm"],
+            result["carbon_price_eur"],
+        )
+        return result
+
+    except Exception as e:
+        logger.warning("Commodity prices: API fetch failed: %s", e)
+
+        # Fall back to cache (even if stale)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    cached = json.load(f)
+                logger.warning("Commodity prices: using stale cache as fallback")
+                return {
+                    "gas_price_ptherm": cached["gas_price_ptherm"],
+                    "carbon_price_eur": cached["carbon_price_eur"],
+                }
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # No cache available — use defaults
+        logger.warning(
+            "Commodity prices: no cache available, using defaults gas=%.0f, carbon=%.0f",
+            defaults["gas_price_ptherm"],
+            defaults["carbon_price_eur"],
+        )
+        return defaults
+
+
+def fetch_system_prices(date_from, date_to):
+    """Fetch half-hourly system buy prices from Elexon BMRS.
+
+    Iterates over each date in the range and fetches settlement system prices.
+    Returns DataFrame with 'system_buy_price' column (GBP/MWh) indexed by UTC datetime.
+    Returns empty DataFrame on failure.
+    """
+    all_rows = []
+    try:
+        start = pd.Timestamp(date_from)
+        end = pd.Timestamp(date_to)
+        dates = pd.date_range(start.normalize(), end.normalize(), freq="D")
+        logger.info("Elexon system prices: fetching %d days (%s to %s)", len(dates), date_from, date_to)
+
+        for date in dates:
+            date_str = date.strftime("%Y-%m-%d")
+            url = f"https://data.elexon.co.uk/bmrs/api/v1/balancing/settlement/system-prices/{date_str}"
+            params = {"format": "json"}
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+                for record in data:
+                    settlement_date = record.get("settlementDate")
+                    settlement_period = record.get("settlementPeriod")
+                    system_buy_price = record.get("systemBuyPrice")
+                    if settlement_date and settlement_period is not None and system_buy_price is not None:
+                        # Settlement period 1 = 00:00-00:30 UTC
+                        dt = pd.Timestamp(settlement_date) + (int(settlement_period) - 1) * pd.Timedelta("30min")
+                        dt = dt.tz_localize("UTC")
+                        all_rows.append({"datetime": dt, "system_buy_price": float(system_buy_price)})
+            except Exception as e:
+                logger.warning("Elexon system prices: failed for date %s: %s", date_str, e)
+                continue
+
+    except Exception as e:
+        logger.warning("Elexon system prices: fetch failed: %s", e)
+        return pd.DataFrame()
+
+    if not all_rows:
+        logger.warning("Elexon system prices: no data returned for %s to %s", date_from, date_to)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows).set_index("datetime").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    logger.info("Elexon system prices: fetched %d records (%s to %s)", len(df), df.index[0], df.index[-1])
+    return df
+
+
+def fetch_ccgt_generation(date_from, date_to):
+    """Fetch half-hourly CCGT generation from Elexon FUELHH dataset.
+
+    Iterates over the date range in 7-day chunks (API has date range limits).
+    Filters for fuelType=CCGT and sums generation per settlement period.
+    Returns DataFrame with 'ccgt_generation_mw' column indexed by UTC datetime.
+    Returns empty DataFrame on failure.
+    """
+    ccgt_rows = {}
+    try:
+        start = pd.Timestamp(date_from).normalize()
+        end = pd.Timestamp(date_to).normalize()
+        logger.info("Elexon CCGT generation: fetching %s to %s", date_from, date_to)
+        # Iterate in 7-day chunks to stay within API limits
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + pd.Timedelta(days=6), end)
+            chunk_from_str = chunk_start.strftime("%Y-%m-%d")
+            chunk_to_str = chunk_end.strftime("%Y-%m-%d")
+            url = "https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH"
+            params = {
+                "settlementDateFrom": chunk_from_str,
+                "settlementDateTo": chunk_to_str,
+                "format": "json",
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=60)
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+
+                for record in data:
+                    if record.get("fuelType") != "CCGT":
+                        continue
+                    settlement_date = record.get("settlementDate")
+                    settlement_period = record.get("settlementPeriod")
+                    generation = record.get("generation")
+                    if settlement_date and settlement_period is not None and generation is not None:
+                        dt = pd.Timestamp(settlement_date) + (int(settlement_period) - 1) * pd.Timedelta("30min")
+                        dt = dt.tz_localize("UTC")
+                        ccgt_rows[dt] = ccgt_rows.get(dt, 0.0) + float(generation)
+            except Exception as e:
+                logger.warning("Elexon FUELHH: failed for chunk %s to %s: %s", chunk_from_str, chunk_to_str, e)
+
+            chunk_start = chunk_end + pd.Timedelta(days=1)
+
+    except Exception as e:
+        logger.warning("Elexon CCGT generation: fetch failed: %s", e)
+        return pd.DataFrame()
+
+    if not ccgt_rows:
+        logger.warning("Elexon FUELHH: no CCGT data found for %s to %s", date_from, date_to)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        [{"datetime": dt, "ccgt_generation_mw": gen} for dt, gen in ccgt_rows.items()]
+    ).set_index("datetime").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    logger.info("Elexon CCGT generation: fetched %d records (%s to %s)", len(df), df.index[0], df.index[-1])
+    return df
+
+
+def fetch_interconnector_flows(date_from, date_to):
+    """Fetch half-hourly net interconnector flows from Elexon BMRS.
+
+    Sums all individual interconnector generation values per settlement period.
+    Returns DataFrame with 'net_interconnector_mw' column (positive = import to GB).
+    Iterates in 7-day chunks to stay within API limits.
+    Returns empty DataFrame on failure.
+    """
+    flow_rows = {}
+    try:
+        start = pd.Timestamp(date_from).normalize()
+        end = pd.Timestamp(date_to).normalize() + pd.Timedelta(days=1)
+        logger.info("Elexon interconnectors: fetching %s to %s", date_from, date_to)
+        # Iterate in 2-day chunks (7-day returns very large responses)
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + pd.Timedelta(days=2), end)
+            from_str = chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+            to_str = chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+            url = "https://data.elexon.co.uk/bmrs/api/v1/generation/outturn/interconnectors"
+            params = {
+                "from": from_str,
+                "to": to_str,
+                "format": "json",
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=60)
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+                logger.info("Elexon interconnectors: chunk %s→%s: %d records", from_str[:10], to_str[:10], len(data))
+
+                for record in data:
+                    start_time = record.get("startTime")
+                    generation = record.get("generation")
+                    if start_time and generation is not None:
+                        dt = pd.Timestamp(start_time)
+                        if dt.tzinfo is None:
+                            dt = dt.tz_localize("UTC")
+                        else:
+                            dt = dt.tz_convert("UTC")
+                        flow_rows[dt] = flow_rows.get(dt, 0.0) + float(generation)
+            except Exception as e:
+                logger.warning(
+                    "Elexon interconnectors: failed for chunk %s to %s: %s",
+                    from_str, to_str, e,
+                )
+
+            chunk_start = chunk_end
+
+    except Exception as e:
+        logger.warning("Elexon interconnector flows: fetch failed: %s", e)
+        return pd.DataFrame()
+
+    if not flow_rows:
+        logger.warning("Elexon interconnectors: no data found for %s to %s", date_from, date_to)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        [{"datetime": dt, "net_interconnector_mw": flow} for dt, flow in flow_rows.items()]
+    ).set_index("datetime").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    logger.info(
+        "Elexon interconnectors: fetched %d records (%s to %s)",
+        len(df), df.index[0], df.index[-1],
+    )
+    return df
+
+
+def fetch_day_ahead_auction(date_from, date_to):
+    """Fetch EPEX day-ahead auction prices from Elexon MID dataset.
+
+    Returns Series of day-ahead prices (GBP/MWh) indexed by UTC datetime.
+    Only includes APXMIDP (EPEX) records.
+    Returns empty Series on failure or when no data is available
+    (e.g. before ~12:00 UK time, or on bank holidays).
+    """
+    auction_rows = {}
+    try:
+        from_str = pd.Timestamp(date_from).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_str = pd.Timestamp(date_to).strftime("%Y-%m-%dT%H:%M:%SZ")
+        logger.info("Elexon MID auction: fetching %s to %s", date_from, date_to)
+
+        url = "https://data.elexon.co.uk/bmrs/api/v1/datasets/MID"
+        params = {
+            "from": from_str,
+            "to": to_str,
+            "format": "json",
+        }
+
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+
+        for record in data:
+            if record.get("dataProvider") != "APXMIDP":
+                continue
+            start_time = record.get("startTime")
+            price = record.get("price")
+            if start_time and price is not None:
+                dt = pd.Timestamp(start_time)
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize("UTC")
+                else:
+                    dt = dt.tz_convert("UTC")
+                auction_rows[dt] = float(price)
+
+    except Exception as e:
+        logger.warning("Elexon MID auction: fetch failed: %s", e)
+        return pd.Series(dtype=float, name="day_ahead_auction")
+
+    if not auction_rows:
+        logger.info("Elexon MID auction: no APXMIDP data for %s to %s (auction may not have run yet)", date_from, date_to)
+        return pd.Series(dtype=float, name="day_ahead_auction")
+
+    series = pd.Series(auction_rows, name="day_ahead_auction").sort_index()
+    series = series[~series.index.duplicated(keep="last")]
+    logger.info("Elexon MID auction: fetched %d APXMIDP records (%s to %s)", len(series), series.index[0], series.index[-1])
+    return series
 
 
 def get_gb60():

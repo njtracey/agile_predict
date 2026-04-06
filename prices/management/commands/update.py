@@ -1,4 +1,5 @@
 import xgboost as xg
+import lightgbm as lgb
 from pathlib import Path
 from sklearn.metrics import mean_squared_error as MSE
 from sklearn.model_selection import cross_val_score
@@ -20,7 +21,7 @@ import os
 import logging
 
 from django.core.management.base import BaseCommand
-from ...models import History, PriceHistory, Forecasts, ForecastData, AgileData
+from ...models import History, PriceHistory, Forecasts, ForecastData, AgileData, OfficialAgileData
 
 from config.utils import *
 from config.settings import GLOBAL_SETTINGS
@@ -123,6 +124,20 @@ class Command(BaseCommand):
             action="store_true",
         )
 
+        parser.add_argument(
+            "--vol_threshold",
+            type=float,
+            default=1.5,
+            help="Volatility ratio threshold for adaptive window (default: 1.5)",
+        )
+
+        parser.add_argument(
+            "--short_window",
+            type=int,
+            default=60,
+            help="Short training window in days when high volatility detected (default: 60)",
+        )
+
         # --bootstrap removed: new smart cleanup strategy is inherently safe for cold start
 
     def handle(self, *args, **options):
@@ -147,6 +162,14 @@ class Command(BaseCommand):
 
         # Cleanup runs AFTER prediction+save (see end of handle) to ensure
         # the current run's output exists before any deletion.
+
+        # Fetch commodity prices (gas + carbon) once at the start
+        commodity_prices = fetch_commodity_prices()
+        logger.info(
+            "Commodity prices: gas=%.2f p/therm, carbon=%.2f EUR/tonne",
+            commodity_prices["gas_price_ptherm"],
+            commodity_prices["carbon_price_eur"],
+        )
 
         prices, start = model_to_df(PriceHistory)
 
@@ -200,6 +223,36 @@ class Command(BaseCommand):
             )
             prices = pd.concat([prices, gb60]).sort_index()
 
+        # --- Fetch day-ahead auction results from Elexon MID (Req 9) ---
+        # Fetch for next 2 days — auction results arrive after ~12:00 UK time
+        mid_from = pd.Timestamp.now(tz="UTC").normalize().strftime("%Y-%m-%d")
+        mid_to = (pd.Timestamp.now(tz="UTC").normalize() + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+        mid_auction = fetch_day_ahead_auction(mid_from, mid_to)
+
+        # Only use auction results for slots not already covered by actual Agile prices
+        if len(mid_auction) > 0:
+            mid_auction.index = mid_auction.index.tz_convert("GB")
+            mid_auction = mid_auction[mid_auction.index > agile_end]
+
+        if len(mid_auction) > 0:
+            # Build a DataFrame matching the prices structure (day_ahead + agile)
+            mid_prices = pd.DataFrame({"day_ahead": mid_auction})
+            mid_prices["agile"] = day_ahead_to_agile(mid_auction, region="F")
+            # Only add slots not already in prices (don't overwrite Agile or GB60)
+            new_mid_slots = mid_prices.index.difference(prices.index)
+            if len(new_mid_slots) > 0:
+                mid_prices = mid_prices.loc[new_mid_slots]
+                prices = pd.concat([prices, mid_prices]).sort_index()
+                logger.info(
+                    "MID auction: added %d slots to prices (%s to %s)",
+                    len(mid_prices), mid_prices.index[0], mid_prices.index[-1],
+                )
+            else:
+                logger.info("MID auction: %d records fetched but all slots already covered by Agile/GB60", len(mid_auction))
+                mid_auction = pd.Series(dtype=float, name="day_ahead_auction")  # reset to empty
+        else:
+            logger.info("MID auction: no data available (auction may not have run yet)")
+
         if debug:
             logger.info(f"Merged prices:\n{prices}")
 
@@ -208,6 +261,33 @@ class Command(BaseCommand):
             logger.info(f"len: {len(prices)} last:{prices.index[-1]}")
             prices = prices.iloc[:-drop_last]
             logger.info(f"len: {len(prices)} last:{prices.index[-1]}")
+
+        # --- Adaptive training window based on price volatility (Req 6) ---
+        # Compute volatility from daily mean day-ahead prices
+        daily_mean_prices = prices["day_ahead"].dropna().resample("D").mean().dropna()
+        vol_30d = daily_mean_prices.tail(30).std() if len(daily_mean_prices) >= 2 else 0.0
+        vol_180d = daily_mean_prices.tail(180).std() if len(daily_mean_prices) >= 2 else 0.0
+        volatility_ratio = vol_30d / vol_180d if vol_180d > 0 else 1.0
+
+        logger.info(
+            "Volatility metrics: vol_30d=%.4f, vol_180d=%.4f, ratio=%.4f",
+            vol_30d, vol_180d, volatility_ratio,
+        )
+
+        VOLATILITY_THRESHOLD = float(options.get("vol_threshold", 1.5) or 1.5)
+        SHORT_WINDOW_DAYS = int(options.get("short_window", 60) or 60)
+
+        if volatility_ratio > VOLATILITY_THRESHOLD:
+            logger.info(
+                "High volatility detected (ratio=%.2f > %.2f), using %d-day window",
+                volatility_ratio, VOLATILITY_THRESHOLD, SHORT_WINDOW_DAYS,
+            )
+            max_days = SHORT_WINDOW_DAYS
+        else:
+            logger.info(
+                "Normal volatility (ratio=%.2f <= %.2f), using configured window (%d days)",
+                volatility_ratio, VOLATILITY_THRESHOLD, max_days,
+            )
 
         new_name = pd.Timestamp.now(tz="GB").strftime("%Y-%m-%d %H:%M")
         if new_name not in [f.name for f in Forecasts.objects.all()]:
@@ -244,6 +324,10 @@ class Command(BaseCommand):
                         list(Forecasts.objects.exclude(id__in=ignore_forecast).values())
                     )
                     scores = []  # initialise so line 707 ref is safe if training block is skipped (e.g. first run)
+                    elexon_features_available = False  # track whether Elexon API data was fetched successfully
+                    interconnector_available = False  # track whether interconnector API data was fetched successfully
+                    conformal_offsets = {}  # conformal prediction offsets per horizon (Req 10)
+                    cal_coverage_rate = None  # conformal calibration coverage rate (Req 10)
 
                     if len(ff) > 0:
                         logger.info(ff)
@@ -300,6 +384,86 @@ class Command(BaseCommand):
                         df["month_sin"] = np.sin(2 * np.pi * month / 12)
                         df["month_cos"] = np.cos(2 * np.pi * month / 12)
 
+                        # --- Lag price features (from PriceHistory) ---
+                        price_series = prices["day_ahead"].sort_index()
+                        price_mean = price_series.mean() if len(price_series) > 0 else 0.0
+
+                        lag_features = pd.DataFrame(index=price_series.index)
+                        lag_features["price_lag_1"] = price_series.shift(1)
+                        lag_features["price_lag_48"] = price_series.shift(48)
+                        lag_features["price_lag_336"] = price_series.shift(336)
+                        lag_features["price_rolling_mean_48"] = price_series.rolling(48).mean()
+                        lag_features = lag_features.fillna(price_mean)
+
+                        for col in lag_features.columns:
+                            df[col] = lag_features[col].reindex(df.index).fillna(price_mean)
+
+                        # --- Price volatility features ---
+                        vol_7d = price_series.rolling(7 * 48, min_periods=48).std()
+                        vol_30d = price_series.rolling(30 * 48, min_periods=48).std()
+
+                        if len(price_series) < 48:
+                            logger.warning("Fewer than 48 price history records — volatility features set to 0.0")
+                            vol_7d = vol_7d.fillna(0.0)
+                            vol_30d = vol_30d.fillna(0.0)
+
+                        df["price_volatility_7d"] = vol_7d.reindex(df.index).ffill().fillna(0.0)
+                        df["price_volatility_30d"] = vol_30d.reindex(df.index).ffill().fillna(0.0)
+
+                        # --- Residual demand feature ---
+                        df["residual_demand"] = df["demand"] - df["bm_wind"] - df["solar"]
+
+                        # --- Commodity price features (Req 2) ---
+                        df["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
+                        df["carbon_price_eur"] = commodity_prices["carbon_price_eur"]
+
+                        # --- Elexon system prices and CCGT generation (Req 2) ---
+                        # Fetch last 30 days only (not full training range — too many API calls)
+                        elexon_from = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+                        elexon_to = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+                        elexon_features_available = False
+
+                        sys_prices_df = fetch_system_prices(elexon_from, elexon_to)
+                        ccgt_gen_df = fetch_ccgt_generation(elexon_from, elexon_to)
+
+                        # Also fetch interconnector flows (Req 3)
+                        interconnector_df = fetch_interconnector_flows(elexon_from, elexon_to)
+                        interconnector_available = False
+
+                        if len(sys_prices_df) > 0 and len(ccgt_gen_df) > 0:
+                            # Merge system prices into training data
+                            df["system_buy_price"] = sys_prices_df["system_buy_price"].reindex(df.index).ffill().bfill()
+                            # Merge CCGT generation into training data
+                            df["ccgt_generation_mw"] = ccgt_gen_df["ccgt_generation_mw"].reindex(df.index).ffill().bfill()
+                            # Compute derived ccgt_share feature
+                            df["ccgt_share"] = df["ccgt_generation_mw"] / df["demand"].replace(0, float("nan")) * 100
+                            df["ccgt_share"] = df["ccgt_share"].fillna(0.0)
+
+                            # Check if we have enough non-NaN values to be useful
+                            if df["system_buy_price"].notna().sum() > 0 and df["ccgt_generation_mw"].notna().sum() > 0:
+                                df["system_buy_price"] = df["system_buy_price"].fillna(0.0)
+                                df["ccgt_generation_mw"] = df["ccgt_generation_mw"].fillna(0.0)
+                                elexon_features_available = True
+                                logger.info("Elexon features: system_buy_price, ccgt_generation_mw, ccgt_share added to training data")
+                            else:
+                                df.drop(columns=["system_buy_price", "ccgt_generation_mw", "ccgt_share"], inplace=True, errors="ignore")
+                                logger.warning("Elexon features: insufficient data after merge, omitting from this run")
+                        else:
+                            logger.warning("Elexon features: API returned empty data, omitting from this run")
+
+                        # --- Interconnector flows (Req 3) ---
+                        if len(interconnector_df) > 0:
+                            df["net_interconnector_mw"] = interconnector_df["net_interconnector_mw"].reindex(df.index).ffill().bfill()
+                            if df["net_interconnector_mw"].notna().sum() > 0:
+                                df["net_interconnector_mw"] = df["net_interconnector_mw"].fillna(0.0)
+                                interconnector_available = True
+                                logger.info("Interconnector feature: net_interconnector_mw added to training data")
+                            else:
+                                df.drop(columns=["net_interconnector_mw"], inplace=True, errors="ignore")
+                                logger.warning("Interconnector feature: insufficient data after merge, omitting from this run")
+                        else:
+                            logger.warning("Interconnector feature: API returned empty data, omitting from this run")
+
                         features = [
                             "bm_wind",
                             "solar",
@@ -312,7 +476,32 @@ class Command(BaseCommand):
                             "hour_cos",
                             "month_sin",
                             "month_cos",
+                            # Lag price features (Req 1)
+                            "price_lag_1",
+                            "price_lag_48",
+                            "price_lag_336",
+                            "price_rolling_mean_48",
+                            # Price volatility features (Req 7)
+                            "price_volatility_7d",
+                            "price_volatility_30d",
+                            # Residual demand (Req 8)
+                            "residual_demand",
+                            # Commodity prices (Req 2)
+                            "gas_price_ptherm",
+                            "carbon_price_eur",
                         ]
+
+                        # Conditionally add Elexon features if API data was available
+                        if elexon_features_available:
+                            features.extend([
+                                "system_buy_price",
+                                "ccgt_generation_mw",
+                                "ccgt_share",
+                            ])
+
+                        # Conditionally add interconnector feature (Req 3)
+                        if interconnector_available:
+                            features.append("net_interconnector_mw")
 
                         # Only use the forecasts closest to 16:15 for training
                         train_X = df[df["forecast_id"].isin(ff_train.index)]
@@ -322,12 +511,20 @@ class Command(BaseCommand):
                         train_X = train_X[
                             (train_X.index >= train_X["ag_start"])
                             & (train_X.index < train_X["ag_end"])
-                        ][features]
+                        ]
+
+                        # --- Capture dt values BEFORE features-only selection (Req 5) ---
+                        # dt is in df but not in features list; we need it for horizon splitting
+                        train_dt = train_X["dt"].copy()
+
+                        train_X = train_X[features]
 
                         # Get the prices to match the forecast
                         train_X = train_X.merge(
                             prices["day_ahead"], left_index=True, right_index=True
                         )
+                        # Align train_dt with train_X after merge (merge may drop rows)
+                        train_dt = train_dt.reindex(train_X.index)
 
                         if debug:
                             logger.info(f"train_X:\n{train_X}")
@@ -355,6 +552,20 @@ class Command(BaseCommand):
                             reg_lambda=0.0095,
                         )
 
+                        # --- LightGBM model (Req 4) ---
+                        lgb_model = lgb.LGBMRegressor(
+                            objective="regression",
+                            learning_rate=0.015,
+                            max_depth=8,
+                            subsample=0.8,
+                            colsample_bytree=0.6,
+                            n_estimators=150,
+                            min_child_weight=4,
+                            reg_alpha=0.003,
+                            reg_lambda=0.01,
+                            verbose=-1,
+                        )
+
                         MAX_CV_SAMPLES = 10_000
                         n_cv = min(5, len(train_X) // 2)
                         if n_cv >= 2:
@@ -366,22 +577,282 @@ class Command(BaseCommand):
                                 cv_y = train_y.iloc[cv_idx]
                             else:
                                 cv_X, cv_y = train_X, train_y
-                            scores = cross_val_score(
+
+                            # XGBoost cross-validation
+                            xg_scores = cross_val_score(
                                 xg_model,
                                 cv_X,
                                 cv_y,
                                 cv=n_cv,
                                 scoring="neg_root_mean_squared_error",
                             )
-                            logger.info(f"Cross-val score: {scores}")
+                            logger.info(f"XGBoost cross-val score: {xg_scores}")
+
+                            # LightGBM cross-validation
+                            lgb_scores = cross_val_score(
+                                lgb_model,
+                                cv_X,
+                                cv_y,
+                                cv=n_cv,
+                                scoring="neg_root_mean_squared_error",
+                            )
+                            logger.info(f"LightGBM cross-val score: {lgb_scores}")
+
+                            # Inverse-RMSE ensemble weights (Req 4)
+                            xg_weight = 1.0 / abs(xg_scores.mean())
+                            lgb_weight = 1.0 / abs(lgb_scores.mean())
+                            total_weight = xg_weight + lgb_weight
+                            xg_weight /= total_weight
+                            lgb_weight /= total_weight
+                            logger.info(
+                                "Ensemble weights: XGBoost=%.3f, LightGBM=%.3f",
+                                xg_weight, lgb_weight,
+                            )
+
+                            # Ensemble scores for the Forecasts model mean/stdev
+                            scores = xg_weight * xg_scores + lgb_weight * lgb_scores
+                            logger.info(f"Ensemble cross-val score: {scores}")
                         else:
+                            xg_scores = np.array([0.0])
+                            lgb_scores = np.array([0.0])
+                            xg_weight = 0.5
+                            lgb_weight = 0.5
                             scores = np.array([0.0])
                             logger.info(
                                 "Too few training samples for cross-validation (n=%d) — skipping cv",
                                 len(train_X),
                             )
 
+                        # --- Conformal Prediction Calibration (Req 10) ---
+                        # Task 6.1: Chronological calibration split
+                        # Train on 80% oldest data, calibrate on 20% most recent
+                        # Then retrain on full data for final predictions
+                        cal_split = int(len(train_X) * 0.8)
+                        conformal_offsets = {}
+
+                        if cal_split >= 50 and (len(train_X) - cal_split) >= 20:
+                            fit_X = train_X.iloc[:cal_split]
+                            fit_y = train_y.iloc[:cal_split]
+                            fit_weights = sample_weights[:cal_split]
+                            cal_X = train_X.iloc[cal_split:]
+                            cal_y = train_y.iloc[cal_split:]
+                            cal_dt = train_dt.iloc[cal_split:]
+
+                            # Log calibration set info
+                            cal_dates = cal_X.index
+                            logger.info(
+                                "Conformal calibration: fit=%d samples, cal=%d samples (%.0f%%/%.0f%%)",
+                                len(fit_X), len(cal_X),
+                                100 * len(fit_X) / len(train_X),
+                                100 * len(cal_X) / len(train_X),
+                            )
+                            logger.info(
+                                "Conformal calibration set: %s to %s",
+                                cal_dates.min(), cal_dates.max(),
+                            )
+
+                            # Train calibration models on the 80% fit set
+                            cal_xg = xg.XGBRegressor(
+                                objective="reg:squarederror",
+                                booster="gbtree",
+                                learning_rate=0.0135,
+                                max_depth=8,
+                                subsample=0.775,
+                                colsample_bytree=0.604,
+                                n_estimators=150,
+                                gamma=0.093,
+                                min_child_weight=4,
+                                reg_alpha=0.003,
+                                reg_lambda=0.0095,
+                            )
+                            cal_lgb = lgb.LGBMRegressor(
+                                objective="regression",
+                                learning_rate=0.015,
+                                max_depth=8,
+                                subsample=0.8,
+                                colsample_bytree=0.6,
+                                n_estimators=150,
+                                min_child_weight=4,
+                                reg_alpha=0.003,
+                                reg_lambda=0.01,
+                                verbose=-1,
+                            )
+                            cal_xg.fit(fit_X, fit_y, sample_weight=fit_weights, verbose=False)
+                            cal_lgb.fit(fit_X, fit_y, sample_weight=fit_weights)
+
+                            # Compute ensemble predictions on calibration set
+                            cal_xg_pred = cal_xg.predict(cal_X)
+                            cal_lgb_pred = cal_lgb.predict(cal_X)
+                            cal_pred = xg_weight * cal_xg_pred + lgb_weight * cal_lgb_pred
+
+                            # Compute signed residuals: actual - predicted
+                            cal_residuals = cal_y.values - cal_pred
+
+                            # Task 6.2: Per-horizon conformal offsets
+                            # Partition calibration residuals by horizon bucket
+                            CONFORMAL_HORIZON_CONFIGS = [
+                                {"name": "near",   "min_hours": -24, "max_hours": 24},
+                                {"name": "medium", "min_hours": 24,  "max_hours": 48},
+                                {"name": "far",    "min_hours": 48,  "max_hours": 999},
+                            ]
+                            MIN_CONFORMAL_SAMPLES = 50
+
+                            # Convert cal_dt from days to hours for horizon bucketing
+                            cal_dt_hours = cal_dt.values * 24
+
+                            for hcfg in CONFORMAL_HORIZON_CONFIGS:
+                                h_mask = (cal_dt_hours >= hcfg["min_hours"]) & (cal_dt_hours < hcfg["max_hours"])
+                                h_residuals = cal_residuals[h_mask]
+
+                                if len(h_residuals) >= MIN_CONFORMAL_SAMPLES:
+                                    q_low = np.percentile(h_residuals, 10)
+                                    q_high = np.percentile(h_residuals, 90)
+                                    logger.info(
+                                        "Conformal offsets '%s': q10=%.3f, q90=%.3f (%d samples)",
+                                        hcfg["name"], q_low, q_high, len(h_residuals),
+                                    )
+                                else:
+                                    # Fall back to overall (all-horizon) percentiles
+                                    q_low = np.percentile(cal_residuals, 10)
+                                    q_high = np.percentile(cal_residuals, 90)
+                                    logger.warning(
+                                        "Conformal offsets '%s': only %d samples (< %d), "
+                                        "falling back to overall offsets q10=%.3f, q90=%.3f",
+                                        hcfg["name"], len(h_residuals), MIN_CONFORMAL_SAMPLES,
+                                        q_low, q_high,
+                                    )
+                                conformal_offsets[hcfg["name"]] = (q_low, q_high)
+
+                            # Task 6.4: Coverage monitoring on calibration set
+                            # Compute coverage using point prediction + conformal offsets
+                            cal_covered = 0
+                            for idx in range(len(cal_y)):
+                                dt_h = cal_dt_hours[idx]
+                                if dt_h < 24:
+                                    h_name = "near"
+                                elif dt_h < 48:
+                                    h_name = "medium"
+                                else:
+                                    h_name = "far"
+                                q_lo, q_hi = conformal_offsets[h_name]
+                                band_low = cal_pred[idx] + q_lo
+                                band_high = cal_pred[idx] + q_hi
+                                if band_low <= cal_y.values[idx] <= band_high:
+                                    cal_covered += 1
+
+                            cal_coverage_rate = 100.0 * cal_covered / len(cal_y) if len(cal_y) > 0 else 0.0
+                            logger.info(
+                                "Conformal calibration coverage: %.1f%% (%d/%d samples)",
+                                cal_coverage_rate, cal_covered, len(cal_y),
+                            )
+                            if cal_coverage_rate < 78 or cal_coverage_rate > 82:
+                                logger.warning(
+                                    "Conformal coverage %.1f%% is outside target range 78-82%%",
+                                    cal_coverage_rate,
+                                )
+                        else:
+                            logger.warning(
+                                "Conformal calibration: insufficient data (n=%d, need fit>=50 and cal>=20), skipping",
+                                len(train_X),
+                            )
+                            cal_coverage_rate = None
+
+                        # Train final models on FULL training data for actual predictions
                         xg_model.fit(train_X, train_y, sample_weight=sample_weights, verbose=True)
+                        lgb_model.fit(train_X, train_y, sample_weight=sample_weights)
+
+                        # --- Horizon-specific models (Req 5) ---
+                        HORIZON_CONFIGS = [
+                            {"name": "near",   "min_days": -1, "max_days": 1,  "min_samples": 100},
+                            {"name": "medium", "min_days": 1,  "max_days": 2,  "min_samples": 100},
+                            {"name": "far",    "min_days": 2,  "max_days": 15, "min_samples": 100},
+                        ]
+
+                        # Task 4.1: Split training data by horizon and log sample counts
+                        horizon_models = {}
+                        for hcfg in HORIZON_CONFIGS:
+                            h_mask = (train_dt >= hcfg["min_days"]) & (train_dt < hcfg["max_days"])
+                            h_count = h_mask.sum()
+                            logger.info(
+                                "Horizon '%s' (%.0f-%.0f days): %d samples",
+                                hcfg["name"], hcfg["min_days"], hcfg["max_days"], h_count,
+                            )
+
+                            if h_count >= hcfg["min_samples"]:
+                                # Task 4.2: Train per-horizon XGBoost + LightGBM ensemble
+                                h_train_X = train_X[h_mask]
+                                h_train_y = train_y[h_mask]
+                                h_weights = sample_weights[h_mask]
+
+                                h_xg = xg.XGBRegressor(
+                                    objective="reg:squarederror",
+                                    booster="gbtree",
+                                    learning_rate=0.0135,
+                                    max_depth=8,
+                                    subsample=0.775,
+                                    colsample_bytree=0.604,
+                                    n_estimators=150,
+                                    gamma=0.093,
+                                    min_child_weight=4,
+                                    reg_alpha=0.003,
+                                    reg_lambda=0.0095,
+                                )
+                                h_lgb = lgb.LGBMRegressor(
+                                    objective="regression",
+                                    learning_rate=0.015,
+                                    max_depth=8,
+                                    subsample=0.8,
+                                    colsample_bytree=0.6,
+                                    n_estimators=150,
+                                    min_child_weight=4,
+                                    reg_alpha=0.003,
+                                    reg_lambda=0.01,
+                                    verbose=-1,
+                                )
+
+                                # Per-horizon cross-validation
+                                h_n_cv = min(5, len(h_train_X) // 2)
+                                if h_n_cv >= 2:
+                                    h_xg_scores = cross_val_score(
+                                        h_xg, h_train_X, h_train_y,
+                                        cv=h_n_cv, scoring="neg_root_mean_squared_error",
+                                    )
+                                    h_lgb_scores = cross_val_score(
+                                        h_lgb, h_train_X, h_train_y,
+                                        cv=h_n_cv, scoring="neg_root_mean_squared_error",
+                                    )
+                                    h_xg_w = 1.0 / abs(h_xg_scores.mean())
+                                    h_lgb_w = 1.0 / abs(h_lgb_scores.mean())
+                                    h_total_w = h_xg_w + h_lgb_w
+                                    h_xg_w /= h_total_w
+                                    h_lgb_w /= h_total_w
+                                    h_ensemble_scores = h_xg_w * h_xg_scores + h_lgb_w * h_lgb_scores
+                                    logger.info(
+                                        "Horizon '%s' CV: XGBoost=%.3f, LightGBM=%.3f, Ensemble=%.3f (weights: XG=%.3f, LGB=%.3f)",
+                                        hcfg["name"],
+                                        -h_xg_scores.mean(), -h_lgb_scores.mean(),
+                                        -h_ensemble_scores.mean(),
+                                        h_xg_w, h_lgb_w,
+                                    )
+                                else:
+                                    h_xg_w = 0.5
+                                    h_lgb_w = 0.5
+                                    logger.info(
+                                        "Horizon '%s': too few samples for CV (%d), using equal weights",
+                                        hcfg["name"], len(h_train_X),
+                                    )
+
+                                h_xg.fit(h_train_X, h_train_y, sample_weight=h_weights, verbose=False)
+                                h_lgb.fit(h_train_X, h_train_y, sample_weight=h_weights)
+
+                                horizon_models[hcfg["name"]] = (h_xg, h_lgb, h_xg_w, h_lgb_w)
+                            else:
+                                # Fall back to combined model
+                                logger.info(
+                                    "Horizon '%s': %d samples < %d minimum, falling back to combined model",
+                                    hcfg["name"], h_count, hcfg["min_samples"],
+                                )
+                                horizon_models[hcfg["name"]] = (xg_model, lgb_model, xg_weight, lgb_weight)
 
                         # Drop the training data set
                         test_X = df[~df["forecast_id"].isin(ff_train.index)]
@@ -422,7 +893,18 @@ class Command(BaseCommand):
                         factor = GLOBAL_SETTINGS["REGIONS"]["X"]["factors"][0]
 
                         results = test_X[["dt", "day_ahead"]].copy()
-                        results["pred"] = xg_model.predict(test_X[features])
+                        xg_test_pred = xg_model.predict(test_X[features])
+                        lgb_test_pred = lgb_model.predict(test_X[features])
+                        results["pred"] = xg_weight * xg_test_pred + lgb_weight * lgb_test_pred
+
+                        # Log individual and ensemble RMSE on test set (Req 4)
+                        xg_test_rmse = np.sqrt(MSE(test_X["day_ahead"], xg_test_pred))
+                        lgb_test_rmse = np.sqrt(MSE(test_X["day_ahead"], lgb_test_pred))
+                        ensemble_test_rmse = np.sqrt(MSE(test_X["day_ahead"], results["pred"]))
+                        logger.info(
+                            "Test RMSE: XGBoost=%.3f, LightGBM=%.3f, Ensemble=%.3f",
+                            xg_test_rmse, lgb_test_rmse, ensemble_test_rmse,
+                        )
 
                         # Add required columns before plotting
                         results["forecast_created"] = test_X["created_at"]
@@ -597,6 +1079,43 @@ class Command(BaseCommand):
                         ax.set_title("XGBoost Feature Importance (Gain)")
                         save_plot(fig, "5_feature_importance")
 
+                        # 5b. LightGBM Feature Importance (Req 4)
+                        lgb_importance = lgb_model.booster_.feature_importance(importance_type="gain")
+                        lgb_feat_names = lgb_model.booster_.feature_name()
+                        lgb_imp_series = pd.Series(lgb_importance, index=lgb_feat_names).sort_values()
+
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        lgb_imp_series.plot.barh(ax=ax)
+                        ax.set_title("LightGBM Feature Importance (Gain)")
+                        ax.set_xlabel("Gain")
+                        save_plot(fig, "5b_lgb_feature_importance")
+
+                        # Log feature importance from both models
+                        xg_importance = xg_model.get_booster().get_score(importance_type="gain")
+                        logger.info("XGBoost feature importance (gain): %s", xg_importance)
+                        logger.info(
+                            "LightGBM feature importance (gain): %s",
+                            dict(zip(lgb_feat_names, lgb_importance.tolist())),
+                        )
+
+                        # 5c. Combined Feature Importance (Req 4)
+                        xg_imp_series = pd.Series(xg_importance)
+                        # Normalise both to sum=1 for fair comparison
+                        xg_norm = xg_imp_series / xg_imp_series.sum() if xg_imp_series.sum() > 0 else xg_imp_series
+                        lgb_norm = lgb_imp_series / lgb_imp_series.sum() if lgb_imp_series.sum() > 0 else lgb_imp_series
+                        combined = pd.DataFrame({
+                            "XGBoost": xg_norm,
+                            "LightGBM": lgb_norm,
+                        }).fillna(0).sort_values("XGBoost", ascending=True)
+
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        combined.plot.barh(ax=ax, width=0.8)
+                        ax.set_title("Combined Feature Importance (Normalised Gain)")
+                        ax.set_xlabel("Normalised Gain")
+                        ax.legend(loc="lower right")
+                        fig.tight_layout()
+                        save_plot(fig, "5c_combined_feature_importance")
+
                         # fig, ax = plt.subplots(figsize=(8, 6))
                         # bins = [0, 1, 2, 3, 5, 10, 15]
                         # labels = [f"{i}-{j}" for i, j in zip(bins[:-1], bins[1:])]
@@ -622,9 +1141,88 @@ class Command(BaseCommand):
                     fc["month_sin"] = np.sin(2 * np.pi * fc_month / 12)
                     fc["month_cos"] = np.cos(2 * np.pi * fc_month / 12)
 
+                    # --- Lag price features for prediction data ---
+                    # Use latest known values from the lag_features computed on PriceHistory
+                    fc_price_series = prices["day_ahead"].sort_index()
+                    fc_price_mean = fc_price_series.mean() if len(fc_price_series) > 0 else 0.0
+
+                    if len(ff) > 0:
+                        # lag_features was computed in the training block above
+                        for col in ["price_lag_1", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
+                            latest_val = lag_features[col].dropna().iloc[-1] if len(lag_features[col].dropna()) > 0 else fc_price_mean
+                            fc[col] = latest_val
+                    else:
+                        for col in ["price_lag_1", "price_lag_48", "price_lag_336", "price_rolling_mean_48"]:
+                            fc[col] = fc_price_mean
+
+                    # --- Price volatility features for prediction data ---
+                    fc_vol_7d = fc_price_series.rolling(7 * 48, min_periods=48).std()
+                    fc_vol_30d = fc_price_series.rolling(30 * 48, min_periods=48).std()
+                    fc["price_volatility_7d"] = fc_vol_7d.iloc[-1] if len(fc_vol_7d.dropna()) > 0 else 0.0
+                    fc["price_volatility_30d"] = fc_vol_30d.iloc[-1] if len(fc_vol_30d.dropna()) > 0 else 0.0
+
+                    # --- Residual demand for prediction data ---
+                    fc["residual_demand"] = fc["demand"] - fc["bm_wind"] - fc["solar"]
+
+                    # --- Commodity price features for prediction data (Req 2) ---
+                    fc["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
+                    fc["carbon_price_eur"] = commodity_prices["carbon_price_eur"]
+
+                    # --- Elexon features for prediction data (Req 2) ---
+                    # Forward-fill from the latest known values
+                    if len(ff) > 0 and elexon_features_available:
+                        # Use the latest known values from the training data
+                        latest_sbp = df["system_buy_price"].dropna().iloc[-1] if len(df["system_buy_price"].dropna()) > 0 else 0.0
+                        latest_ccgt = df["ccgt_generation_mw"].dropna().iloc[-1] if len(df["ccgt_generation_mw"].dropna()) > 0 else 0.0
+                        fc["system_buy_price"] = latest_sbp
+                        fc["ccgt_generation_mw"] = latest_ccgt
+                        # Compute ccgt_share for prediction data
+                        fc["ccgt_share"] = fc["ccgt_generation_mw"] / fc["demand"].replace(0, float("nan")) * 100
+                        fc["ccgt_share"] = fc["ccgt_share"].fillna(0.0)
+                        logger.info(
+                            "Elexon prediction features: system_buy_price=%.2f, ccgt_generation_mw=%.0f (forward-filled)",
+                            latest_sbp, latest_ccgt,
+                        )
+
+                    # --- Interconnector feature for prediction data (Req 3) ---
+                    # Forward-fill from the latest known interconnector flow
+                    if len(ff) > 0 and interconnector_available:
+                        latest_interconnector = df["net_interconnector_mw"].dropna().iloc[-1] if len(df["net_interconnector_mw"].dropna()) > 0 else 0.0
+                        fc["net_interconnector_mw"] = latest_interconnector
+                        logger.info(
+                            "Interconnector prediction feature: net_interconnector_mw=%.0f (forward-filled)",
+                            latest_interconnector,
+                        )
+
                     if len(ff) > 0:
                         fc_pred_input = fc.drop("emb_wind", axis=1).reindex(train_X.columns, axis=1)
-                        fc["day_ahead"] = xg_model.predict(fc_pred_input)
+
+                        # --- Task 4.3: Horizon-based prediction selection (Req 5) ---
+                        fc_dt = fc["dt"].values
+                        fc_day_ahead = np.zeros(len(fc))
+                        horizon_slot_counts = {"near": 0, "medium": 0, "far": 0}
+
+                        for i in range(len(fc)):
+                            dt_val = fc_dt[i]
+                            if dt_val < 1:
+                                h_name = "near"
+                            elif dt_val < 2:
+                                h_name = "medium"
+                            else:
+                                h_name = "far"
+
+                            h_xg, h_lgb, h_xg_w, h_lgb_w = horizon_models[h_name]
+                            row_input = fc_pred_input.iloc[[i]]
+                            fc_day_ahead[i] = h_xg_w * h_xg.predict(row_input)[0] + h_lgb_w * h_lgb.predict(row_input)[0]
+                            horizon_slot_counts[h_name] += 1
+
+                        fc["day_ahead"] = fc_day_ahead
+                        logger.info(
+                            "Horizon prediction slots: near=%d, medium=%d, far=%d",
+                            horizon_slot_counts["near"],
+                            horizon_slot_counts["medium"],
+                            horizon_slot_counts["far"],
+                        )
 
                         if (len(test_X) > 10) and (not no_ranges):
                             # Graduated quantile regression: tighter bands near-term,
@@ -636,68 +1234,165 @@ class Command(BaseCommand):
                                 (7, 15, 0.03, 0.97),  # days 7-14: widest
                             ]
 
-                            # Train quantile models (reuse same training data)
-                            qr_models = {}
+                            # Train quantile models — per-horizon where possible (Req 5)
+                            # For each quantile pair, train on the appropriate horizon subset
+                            # if it has enough samples, otherwise fall back to combined training data
+                            def _train_qr_pair(q_lo, q_hi, tr_X, tr_y, sw, xg_w, lgb_w, pred_input):
+                                """Train XGBoost+LightGBM quantile pair and return blended predictions."""
+                                qr_params_lo = dict(
+                                    objective="reg:quantileerror",
+                                    quantile_alpha=q_lo,
+                                    booster="gbtree",
+                                    learning_rate=0.0135,
+                                    max_depth=8,
+                                    subsample=0.775,
+                                    colsample_bytree=0.604,
+                                    n_estimators=150,
+                                    gamma=0.093,
+                                    min_child_weight=4,
+                                    reg_alpha=0.003,
+                                    reg_lambda=0.0095,
+                                )
+                                qr_params_hi = dict(qr_params_lo)
+                                qr_params_hi["quantile_alpha"] = q_hi
+
+                                xg_m_lo = xg.XGBRegressor(**qr_params_lo)
+                                xg_m_lo.fit(tr_X, tr_y, sample_weight=sw, verbose=False)
+                                xg_m_hi = xg.XGBRegressor(**qr_params_hi)
+                                xg_m_hi.fit(tr_X, tr_y, sample_weight=sw, verbose=False)
+
+                                lgb_m_lo = lgb.LGBMRegressor(
+                                    objective="quantile", alpha=q_lo,
+                                    learning_rate=0.015, max_depth=8, subsample=0.8,
+                                    colsample_bytree=0.6, n_estimators=150,
+                                    min_child_weight=4, reg_alpha=0.003, reg_lambda=0.01, verbose=-1,
+                                )
+                                lgb_m_lo.fit(tr_X, tr_y, sample_weight=sw)
+                                lgb_m_hi = lgb.LGBMRegressor(
+                                    objective="quantile", alpha=q_hi,
+                                    learning_rate=0.015, max_depth=8, subsample=0.8,
+                                    colsample_bytree=0.6, n_estimators=150,
+                                    min_child_weight=4, reg_alpha=0.003, reg_lambda=0.01, verbose=-1,
+                                )
+                                lgb_m_hi.fit(tr_X, tr_y, sample_weight=sw)
+
+                                blended_lo = xg_w * xg_m_lo.predict(pred_input) + lgb_w * lgb_m_lo.predict(pred_input)
+                                blended_hi = xg_w * xg_m_hi.predict(pred_input) + lgb_w * lgb_m_hi.predict(pred_input)
+                                return blended_lo, blended_hi
+
+                            # Train combined (fallback) quantile models
+                            qr_models_combined = {}
                             for _, _, q_lo, q_hi in qr_schedule:
-                                if (q_lo, q_hi) not in qr_models:
-                                    qr_params_lo = dict(
-                                        objective="reg:quantileerror",
-                                        quantile_alpha=q_lo,
-                                        booster="gbtree",
-                                        learning_rate=0.0135,
-                                        max_depth=8,
-                                        subsample=0.775,
-                                        colsample_bytree=0.604,
-                                        n_estimators=150,
-                                        gamma=0.093,
-                                        min_child_weight=4,
-                                        reg_alpha=0.003,
-                                        reg_lambda=0.0095,
-                                    )
-                                    qr_params_hi = dict(qr_params_lo)
-                                    qr_params_hi["quantile_alpha"] = q_hi
-
-                                    m_lo = xg.XGBRegressor(**qr_params_lo)
-                                    m_lo.fit(
-                                        train_X,
-                                        train_y,
-                                        sample_weight=sample_weights,
-                                        verbose=False,
-                                    )
-                                    m_hi = xg.XGBRegressor(**qr_params_hi)
-                                    m_hi.fit(
-                                        train_X,
-                                        train_y,
-                                        sample_weight=sample_weights,
-                                        verbose=False,
-                                    )
-                                    qr_models[(q_lo, q_hi)] = (
-                                        m_lo.predict(fc_pred_input),
-                                        m_hi.predict(fc_pred_input),
+                                if (q_lo, q_hi) not in qr_models_combined:
+                                    qr_models_combined[(q_lo, q_hi)] = _train_qr_pair(
+                                        q_lo, q_hi, train_X, train_y, sample_weights,
+                                        xg_weight, lgb_weight, fc_pred_input,
                                     )
 
-                            # Assign bands per horizon bucket
+                            # Train per-horizon quantile models where horizon has dedicated model
+                            qr_models_horizon = {}  # key: (horizon_name, q_lo, q_hi)
+                            for hcfg in HORIZON_CONFIGS:
+                                h_name = hcfg["name"]
+                                h_xg, h_lgb, h_xg_w, h_lgb_w = horizon_models[h_name]
+                                # Only train horizon-specific quantile models if the horizon
+                                # has its own dedicated model (not the combined fallback)
+                                if h_xg is not xg_model:
+                                    h_mask = (train_dt >= hcfg["min_days"]) & (train_dt < hcfg["max_days"])
+                                    h_tr_X = train_X[h_mask]
+                                    h_tr_y = train_y[h_mask]
+                                    h_sw = sample_weights[h_mask]
+                                    for _, _, q_lo, q_hi in qr_schedule:
+                                        if (h_name, q_lo, q_hi) not in qr_models_horizon:
+                                            qr_models_horizon[(h_name, q_lo, q_hi)] = _train_qr_pair(
+                                                q_lo, q_hi, h_tr_X, h_tr_y, h_sw,
+                                                h_xg_w, h_lgb_w, fc_pred_input,
+                                            )
+
+                            # Assign bands per slot using horizon-specific quantile models
                             horizon_days = fc["dt"].values
                             low_pred = np.full(len(fc), np.nan)
                             high_pred = np.full(len(fc), np.nan)
 
                             for h_lo, h_hi, q_lo, q_hi in qr_schedule:
                                 mask = (horizon_days >= h_lo) & (horizon_days < h_hi)
-                                ml_pred, mh_pred = qr_models[(q_lo, q_hi)]
-                                low_pred[mask] = ml_pred[mask]
-                                high_pred[mask] = mh_pred[mask]
+                                if not mask.any():
+                                    continue
+
+                                # Determine which horizon bucket each slot belongs to
+                                for i in np.where(mask)[0]:
+                                    dt_val = horizon_days[i]
+                                    if dt_val < 1:
+                                        h_name = "near"
+                                    elif dt_val < 2:
+                                        h_name = "medium"
+                                    else:
+                                        h_name = "far"
+
+                                    # Use horizon-specific quantile model if available
+                                    if (h_name, q_lo, q_hi) in qr_models_horizon:
+                                        bl, bh = qr_models_horizon[(h_name, q_lo, q_hi)]
+                                    else:
+                                        bl, bh = qr_models_combined[(q_lo, q_hi)]
+                                    low_pred[i] = bl[i]
+                                    high_pred[i] = bh[i]
 
                             # Fallback for any unassigned slots (use widest quantile)
                             remaining = np.isnan(low_pred)
                             if remaining.any():
                                 widest_q = (qr_schedule[-1][2], qr_schedule[-1][3])
-                                ml_pred, mh_pred = qr_models[widest_q]
+                                ml_pred, mh_pred = qr_models_combined[widest_q]
                                 low_pred[remaining] = ml_pred[remaining]
                                 high_pred[remaining] = mh_pred[remaining]
 
                             # Ensure low <= point <= high
                             fc["day_ahead_low"] = np.minimum(low_pred, fc["day_ahead"].values)
                             fc["day_ahead_high"] = np.maximum(high_pred, fc["day_ahead"].values)
+
+                            # --- Task 6.3: Apply conformal widening to bands (Req 10) ---
+                            if conformal_offsets:
+                                fc_dt_hours = fc["dt"].values * 24
+                                # Identify auction-filled slots to skip conformal widening
+                                auction_slots = set()
+                                if len(mid_auction) > 0:
+                                    auction_slots = set(mid_auction.index.intersection(fc.index))
+
+                                n_widened = 0
+                                for i in range(len(fc)):
+                                    # Skip auction-filled slots (Req 9) — keep their ±1 p/kWh bands
+                                    if fc.index[i] in auction_slots:
+                                        continue
+
+                                    dt_h = fc_dt_hours[i]
+                                    if dt_h < 24:
+                                        h_name = "near"
+                                    elif dt_h < 48:
+                                        h_name = "medium"
+                                    else:
+                                        h_name = "far"
+
+                                    q_lo, q_hi = conformal_offsets[h_name]
+                                    point_pred = fc["day_ahead"].values[i]
+                                    current_low = fc["day_ahead_low"].values[i]
+                                    current_high = fc["day_ahead_high"].values[i]
+
+                                    # Widen only (never narrow): use min for low, max for high
+                                    new_low = min(current_low, point_pred + q_lo)
+                                    new_high = max(current_high, point_pred + q_hi)
+
+                                    # Ensure low <= point <= high
+                                    new_low = min(new_low, point_pred)
+                                    new_high = max(new_high, point_pred)
+
+                                    if new_low != current_low or new_high != current_high:
+                                        n_widened += 1
+
+                                    fc.iloc[i, fc.columns.get_loc("day_ahead_low")] = new_low
+                                    fc.iloc[i, fc.columns.get_loc("day_ahead_high")] = new_high
+
+                                logger.info(
+                                    "Conformal widening: %d/%d slots widened (%d auction slots skipped)",
+                                    n_widened, len(fc) - len(auction_slots), len(auction_slots),
+                                )
 
                         else:
                             fc["day_ahead_low"] = fc["day_ahead"] * 0.9
@@ -723,6 +1418,9 @@ class Command(BaseCommand):
                         )
                     ]
 
+                    # Track which slots are covered by actual/known prices
+                    covered_idx = sfs[0].index
+
                     if len(gb60) > 0:
                         sfs.append(
                             pd.DataFrame(
@@ -730,19 +1428,41 @@ class Command(BaseCommand):
                                 data={"mult": 0, "shift": 5},
                             )
                         )
-                        sfs.append(
-                            pd.DataFrame(
-                                index=fc.index.difference(sfs[0].index.union(sfs[1].index)),
-                                data={"mult": 1, "shift": 0},
+                        covered_idx = covered_idx.union(sfs[-1].index)
+
+                    # --- MID auction scale factors (Req 9) ---
+                    # Slots with auction results that aren't already covered by Agile or GB60
+                    # get mult=0 (use actual auction price) and shift=1 (±1 p/kWh bands)
+                    n_auction_slots = 0
+                    if len(mid_auction) > 0:
+                        mid_auction_idx = mid_auction.index.intersection(fc.index).difference(covered_idx)
+                        if len(mid_auction_idx) > 0:
+                            sfs.append(
+                                pd.DataFrame(
+                                    index=mid_auction_idx,
+                                    data={"mult": 0, "shift": 1},
+                                )
                             )
+                            covered_idx = covered_idx.union(mid_auction_idx)
+                            n_auction_slots = len(mid_auction_idx)
+
+                    # Remaining slots use model predictions
+                    model_pred_idx = fc.index.difference(covered_idx)
+                    sfs.append(
+                        pd.DataFrame(
+                            index=model_pred_idx,
+                            data={"mult": 1, "shift": 0},
                         )
-                    else:
-                        sfs.append(
-                            pd.DataFrame(
-                                index=fc.index.difference(sfs[0].index),
-                                data={"mult": 1, "shift": 0},
-                            )
-                        )
+                    )
+
+                    # Log slot counts (Req 9 acceptance criteria 5)
+                    logger.info(
+                        "Blending: %d actual Agile, %d GB60, %d MID auction, %d model prediction slots",
+                        len(sfs[0]),
+                        len(sfs[1]) if len(gb60) > 0 else 0,
+                        n_auction_slots,
+                        len(model_pred_idx),
+                    )
 
                     fc = fc.astype(float)
                     scale_factors = pd.concat(sfs)
@@ -830,6 +1550,14 @@ class Command(BaseCommand):
 
                     mean_score = -np.mean(scores) if len(scores) > 0 else 0.0
                     stdev_score = np.std(scores) if len(scores) > 0 else 0.0
+
+                    # Log conformal coverage rate alongside forecast metadata (Req 10)
+                    if cal_coverage_rate is not None:
+                        logger.info(
+                            "Forecast metadata: RMSE=%.3f, stdev=%.3f, conformal_coverage=%.1f%%",
+                            mean_score, stdev_score, cal_coverage_rate,
+                        )
+
                     # Drop rows with NaN predictions (slots beyond forecast data range
                     # where scale factor alignment produces NaN)
                     nan_count = (
@@ -848,6 +1576,50 @@ class Command(BaseCommand):
                     df_to_Model(fc, ForecastData)
                     df_to_Model(ag, AgileData)
 
+        # --- Fetch official agilepredict.com predictions for comparison ---
+        try:
+            _this_fc = this_forecast  # noqa: F841 — will NameError if prediction was skipped
+        except NameError:
+            _this_fc = None
+
+        if _this_fc is not None:
+            try:
+                import requests as _requests
+
+                OFFICIAL_API = "https://agilepredict.com/api/F/?high_low=true"
+                OFFICIAL_TIMEOUT = 30
+
+                resp = _requests.get(OFFICIAL_API, timeout=OFFICIAL_TIMEOUT)
+                resp.raise_for_status()
+                official_data = resp.json()
+
+                official_rows = []
+                for forecast_block in official_data:
+                    for price in forecast_block.get("prices", []):
+                        official_rows.append({
+                            "forecast": _this_fc,
+                            "date_time": pd.Timestamp(price["date_time"]),
+                            "agile_pred": price["agile_pred"],
+                            "agile_low": price["agile_low"],
+                            "agile_high": price["agile_high"],
+                        })
+
+                created = 0
+                for row in official_rows:
+                    _, was_created = OfficialAgileData.objects.get_or_create(
+                        forecast=row["forecast"],
+                        date_time=row["date_time"],
+                        defaults=row,
+                    )
+                    if was_created:
+                        created += 1
+                logger.info("Official predictions: stored %d/%d rows", created, len(official_rows))
+
+            except Exception as e:
+                logger.warning("Failed to fetch official agilepredict.com predictions: %s", e)
+        else:
+            logger.info("Official predictions: skipped (no forecast this run)")
+
         if debug:
             for f in Forecasts.objects.all().order_by("-created_at"):
                 logger.info(f"{f.id:4d}: {f.name}")
@@ -862,7 +1634,7 @@ class Command(BaseCommand):
         #
         # Phase 1 — Dedup: keep 1 forecast per calendar day (closest to 16:15)
         #           + always the newest.  Delete duplicates via CASCADE
-        #           (removes their ForecastData + AgileData).
+        #           (removes their ForecastData + AgileData + OfficialAgileData).
         #
         # Phase 2 — AgileData trim: for kept forecasts older than
         #           AGILE_DATA_RETENTION_DAYS, delete AgileData for all
@@ -871,6 +1643,10 @@ class Command(BaseCommand):
         #           ongoing prediction accuracy analysis (prediction vs
         #           actual from PriceHistory).  ~18 MB/year, ~175 MB/10yr.
         #           StatsView error heatmap also benefits from this.
+        #
+        # Phase 2b — OfficialAgileData trim: for the same old kept forecasts,
+        #            delete all OfficialAgileData rows (always region F,
+        #            no region filtering needed).
         #
         # Never deleted: PriceHistory, ForecastData, AgileData(local region).
         # Growth: ~23 MB/year (FD ~5 MB + PH ~0.5 MB + AD(F) ~18 MB).
@@ -919,7 +1695,7 @@ class Command(BaseCommand):
 
             keep_ids.update(fid for fid, _, _ in daily_best.values())
 
-            # Phase 1: delete duplicate forecasts (CASCADE removes FD + AD)
+            # Phase 1: delete duplicate forecasts (CASCADE removes FD + AD + OAD)
             to_delete = Forecasts.objects.exclude(id__in=keep_ids)
             n_delete = to_delete.count()
             if n_delete > 0:
@@ -967,6 +1743,26 @@ class Command(BaseCommand):
                     )
                 elif debug:
                     logger.info("Cleanup phase 2: no old AgileData to trim")
+
+                # Phase 2b: trim OfficialAgileData from old kept forecasts.
+                # No region filtering needed — OfficialAgileData is always region F.
+                # CASCADE in Phase 1 already handles duplicate forecast deletion;
+                # this handles the retention-window trim for kept forecasts.
+                oad_to_delete = OfficialAgileData.objects.filter(
+                    forecast_id__in=old_forecast_ids
+                )
+                oad_count = oad_to_delete.count()
+                if oad_count > 0:
+                    oad_to_delete.delete()
+                    logger.info(
+                        "Cleanup phase 2b: deleted %d OfficialAgileData rows from %d"
+                        " forecasts older than %d days",
+                        oad_count,
+                        len(old_forecast_ids),
+                        AGILE_DATA_RETENTION_DAYS,
+                    )
+                elif debug:
+                    logger.info("Cleanup phase 2b: no old OfficialAgileData to trim")
             elif debug:
                 logger.info(
                     "Cleanup phase 2: no forecasts older than %d days", AGILE_DATA_RETENTION_DAYS
