@@ -1894,9 +1894,14 @@ class Command(BaseCommand):
         # --- Smart cleanup: runs AFTER prediction+save ---
         # Strategy: preserve all training data, minimise storage growth
         #
-        # Phase 1 — Dedup: keep 1 forecast per calendar day (closest to 16:15)
+        # Phase 1 — Dedup: keep up to 3 forecasts per calendar day:
+        #           - closest to 08:00 (pre-auction baseline)
+        #           - closest to 16:15 (post-auction, best quality)
+        #           - closest to 00:00 (overnight)
         #           + always the newest.  Delete duplicates via CASCADE
-        #           (removes their ForecastData + AgileData + OfficialAgileData).
+        #           (removes their ForecastData + AgileData).
+        #           OfficialAgileData is NOT deleted — kept permanently
+        #           for head-to-head comparison analysis.
         #
         # Phase 2 — AgileData trim: for kept forecasts older than
         #           AGILE_DATA_RETENTION_DAYS, delete AgileData for all
@@ -1906,12 +1911,13 @@ class Command(BaseCommand):
         #           actual from PriceHistory).  ~18 MB/year, ~175 MB/10yr.
         #           StatsView error heatmap also benefits from this.
         #
-        # Phase 2b — OfficialAgileData trim: for the same old kept forecasts,
-        #            delete all OfficialAgileData rows (always region F,
-        #            no region filtering needed).
+        # OfficialAgileData is NEVER deleted (except via CASCADE when
+        # duplicate forecasts are removed). Kept permanently for
+        # head-to-head comparison. Growth: ~1.8 KB/day, ~0.6 MB/year.
         #
-        # Never deleted: PriceHistory, ForecastData, AgileData(local region).
-        # Growth: ~23 MB/year (FD ~5 MB + PH ~0.5 MB + AD(F) ~18 MB).
+        # Never deleted: PriceHistory, ForecastData, AgileData(local region),
+        #                OfficialAgileData.
+        # Growth: ~28 MB/year (FD ~15 MB + PH ~0.5 MB + AD(F) ~12 MB + OAD ~0.6 MB).
         AGILE_DATA_RETENTION_DAYS = 14
         # Region whose AgileData is kept permanently for accuracy analysis.
         # Matches the DNO region code used by run_agile_predict_update.py.
@@ -1933,9 +1939,15 @@ class Command(BaseCommand):
             # Pre-compute which forecasts have AgileData (real predictions)
             ids_with_agile = set(AgileData.objects.values_list("forecast_id", flat=True).distinct())
 
-            # Keep best forecast per calendar day (no retention window — keep all days)
+            # Keep best forecasts per calendar day (up to 3: closest to 00:00, 08:00, 16:15)
             # Prefer real forecasts (with AgileData) over backfilled ones
-            daily_best = {}
+            # This enables intra-day convergence analysis and time-of-day accuracy comparison
+            KEEP_TARGETS = [
+                ("night", pd.Timedelta(hours=0, minutes=0)),
+                ("morning", pd.Timedelta(hours=8, minutes=0)),
+                ("afternoon", pd.Timedelta(hours=16, minutes=15)),
+            ]
+            daily_best = {}  # key: (date_key, target_name) → (f.id, has_agile, distance)
             for f in all_forecasts:
                 try:
                     dt = pd.to_datetime(f.name).tz_localize("GB")
@@ -1943,17 +1955,18 @@ class Command(BaseCommand):
                     continue
                 date_key = dt.normalize()
                 has_agile = f.id in ids_with_agile
-                target_1615 = date_key + pd.Timedelta(hours=16, minutes=15)
-                distance = abs((dt - target_1615).total_seconds())
-                if date_key not in daily_best:
-                    daily_best[date_key] = (f.id, has_agile, distance)
-                else:
-                    _, prev_has_agile, prev_distance = daily_best[date_key]
-                    # Real forecast always wins over backfilled
-                    if has_agile and not prev_has_agile:
-                        daily_best[date_key] = (f.id, has_agile, distance)
-                    elif has_agile == prev_has_agile and distance < prev_distance:
-                        daily_best[date_key] = (f.id, has_agile, distance)
+                for target_name, target_offset in KEEP_TARGETS:
+                    target_time = date_key + target_offset
+                    distance = abs((dt - target_time).total_seconds())
+                    slot_key = (date_key, target_name)
+                    if slot_key not in daily_best:
+                        daily_best[slot_key] = (f.id, has_agile, distance)
+                    else:
+                        _, prev_has_agile, prev_distance = daily_best[slot_key]
+                        if has_agile and not prev_has_agile:
+                            daily_best[slot_key] = (f.id, has_agile, distance)
+                        elif has_agile == prev_has_agile and distance < prev_distance:
+                            daily_best[slot_key] = (f.id, has_agile, distance)
 
             keep_ids.update(fid for fid, _, _ in daily_best.values())
 
@@ -2005,26 +2018,6 @@ class Command(BaseCommand):
                     )
                 elif debug:
                     logger.info("Cleanup phase 2: no old AgileData to trim")
-
-                # Phase 2b: trim OfficialAgileData from old kept forecasts.
-                # No region filtering needed — OfficialAgileData is always region F.
-                # CASCADE in Phase 1 already handles duplicate forecast deletion;
-                # this handles the retention-window trim for kept forecasts.
-                oad_to_delete = OfficialAgileData.objects.filter(
-                    forecast_id__in=old_forecast_ids
-                )
-                oad_count = oad_to_delete.count()
-                if oad_count > 0:
-                    oad_to_delete.delete()
-                    logger.info(
-                        "Cleanup phase 2b: deleted %d OfficialAgileData rows from %d"
-                        " forecasts older than %d days",
-                        oad_count,
-                        len(old_forecast_ids),
-                        AGILE_DATA_RETENTION_DAYS,
-                    )
-                elif debug:
-                    logger.info("Cleanup phase 2b: no old OfficialAgileData to trim")
             elif debug:
                 logger.info(
                     "Cleanup phase 2: no forecasts older than %d days", AGILE_DATA_RETENTION_DAYS
