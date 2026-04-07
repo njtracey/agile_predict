@@ -338,6 +338,143 @@ def compute_prediction_convergence(conn, days):
     return {"by_horizon": convergence}
 
 
+def compute_time_of_day_accuracy(conn, days):
+    """Compare forecast accuracy by time-of-day when the forecast was generated.
+
+    With 3 forecasts kept per day (00:00, 08:00, 16:15), this shows whether
+    the afternoon run (with auction data) outperforms the morning run.
+    """
+    cutoff = (
+        pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    query = """
+        SELECT
+            p.agile_pred,
+            p.date_time AS target_dt,
+            f.name AS forecast_name,
+            f.created_at AS forecast_created,
+            ph.agile AS actual
+        FROM prices_agiledata p
+        JOIN prices_pricehistory ph ON p.date_time = ph.date_time
+        JOIN prices_forecasts f ON p.forecast_id = f.id
+        WHERE p.region = 'F'
+        AND ph.date_time >= ?
+    """
+
+    df = pd.read_sql_query(query, conn, params=[cutoff])
+
+    if len(df) < MIN_PAIRS_FOR_METRIC:
+        return {"status": "insufficient_data", "n": len(df)}
+
+    df["target_dt"] = pd.to_datetime(df["target_dt"])
+    df["forecast_created"] = pd.to_datetime(df["forecast_created"])
+    df["horizon_hours"] = (
+        df["target_dt"] - df["forecast_created"]
+    ).dt.total_seconds() / 3600
+
+    # Extract forecast hour-of-day from the forecast name (UK time)
+    df["forecast_hour"] = pd.to_datetime(df["forecast_name"]).dt.hour
+
+    # Bucket forecasts by time-of-day slot
+    TOD_BUCKETS = [
+        ("night_00", 0, 4),
+        ("morning_08", 4, 12),
+        ("afternoon_16", 12, 24),
+    ]
+
+    by_tod = {}
+    for label, h_min, h_max in TOD_BUCKETS:
+        mask = (df["forecast_hour"] >= h_min) & (df["forecast_hour"] < h_max)
+        subset = df[mask]
+        if len(subset) < MIN_PAIRS_FOR_METRIC:
+            by_tod[label] = {"status": "insufficient_data", "n": len(subset)}
+        else:
+            errors = np.abs(subset["agile_pred"] - subset["actual"])
+            by_tod[label] = {
+                "mae": safe_float(errors.mean()),
+                "rmse": safe_float(np.sqrt(np.mean(errors**2))),
+                "n": int(len(subset)),
+                "unique_forecasts": int(subset["forecast_name"].nunique()),
+            }
+
+    return {"by_time_of_day": by_tod}
+
+
+def compute_intraday_convergence(conn, days):
+    """Show how predictions for the same target slot improve across forecast runs within a day.
+
+    For target slots that were predicted by multiple forecast runs on the same day,
+    compare the accuracy of the earliest vs latest forecast.
+    """
+    cutoff = (
+        pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    query = """
+        SELECT
+            p.agile_pred,
+            p.date_time AS target_dt,
+            f.name AS forecast_name,
+            f.created_at AS forecast_created,
+            ph.agile AS actual
+        FROM prices_agiledata p
+        JOIN prices_pricehistory ph ON p.date_time = ph.date_time
+        JOIN prices_forecasts f ON p.forecast_id = f.id
+        WHERE p.region = 'F'
+        AND ph.date_time >= ?
+    """
+
+    df = pd.read_sql_query(query, conn, params=[cutoff])
+
+    if len(df) < MIN_PAIRS_FOR_METRIC:
+        return {"status": "insufficient_data", "n": len(df)}
+
+    df["target_dt"] = pd.to_datetime(df["target_dt"])
+    df["forecast_created"] = pd.to_datetime(df["forecast_created"])
+    df["error"] = np.abs(df["agile_pred"] - df["actual"])
+    df["horizon_hours"] = (
+        df["target_dt"] - df["forecast_created"]
+    ).dt.total_seconds() / 3600
+
+    # Group by target slot, find slots predicted by multiple forecasts
+    grouped = df.groupby("target_dt")
+    multi_forecast_slots = grouped.filter(lambda x: x["forecast_name"].nunique() >= 2)
+
+    if len(multi_forecast_slots) < MIN_PAIRS_FOR_METRIC:
+        return {
+            "status": "insufficient_data",
+            "note": "Need more days with multiple forecasts per day",
+            "n": len(multi_forecast_slots),
+        }
+
+    # For each target slot, compare earliest vs latest forecast
+    results = []
+    for target_dt, group in multi_forecast_slots.groupby("target_dt"):
+        group = group.sort_values("forecast_created")
+        earliest = group.iloc[0]
+        latest = group.iloc[-1]
+        results.append({
+            "earliest_error": earliest["error"],
+            "latest_error": latest["error"],
+            "earliest_horizon_h": earliest["horizon_hours"],
+            "latest_horizon_h": latest["horizon_hours"],
+        })
+
+    res_df = pd.DataFrame(results)
+    improvement = res_df["earliest_error"] - res_df["latest_error"]
+
+    return {
+        "slots_with_multiple_forecasts": int(len(res_df)),
+        "earliest_forecast_mae": safe_float(res_df["earliest_error"].mean()),
+        "latest_forecast_mae": safe_float(res_df["latest_error"].mean()),
+        "mean_improvement": safe_float(improvement.mean()),
+        "pct_improved": safe_float(100.0 * (improvement > 0).sum() / len(improvement)),
+        "avg_earliest_horizon_h": safe_float(res_df["earliest_horizon_h"].mean()),
+        "avg_latest_horizon_h": safe_float(res_df["latest_horizon_h"].mean()),
+    }
+
+
 def compute_training_state(conn):
     """Extract RMSE trend, training data volume, feature list from Forecasts."""
     query = """
@@ -512,6 +649,35 @@ def format_text_output(result):
                     f"n={m['n']}, slots={m['unique_target_slots']}"
                 )
 
+    # Time-of-day accuracy
+    lines.append("\n--- Time-of-Day Accuracy ---")
+    tod = result.get("time_of_day_accuracy", {})
+    if "status" in tod:
+        lines.append(f"  {tod['status']}")
+    else:
+        for slot, m in tod.get("by_time_of_day", {}).items():
+            if "status" in m:
+                lines.append(f"    {slot:20s}: {m['status']} (n={m.get('n', 0)})")
+            else:
+                lines.append(
+                    f"    {slot:20s}: MAE={m['mae']}, RMSE={m['rmse']}, "
+                    f"n={m['n']}, forecasts={m['unique_forecasts']}"
+                )
+
+    # Intraday convergence
+    lines.append("\n--- Intraday Convergence ---")
+    idc = result.get("intraday_convergence", {})
+    if "status" in idc:
+        lines.append(f"  {idc['status']}: {idc.get('note', '')} (n={idc.get('n', 0)})")
+    else:
+        lines.append(f"  Slots with multiple forecasts: {idc['slots_with_multiple_forecasts']}")
+        lines.append(f"  Earliest forecast MAE: {idc['earliest_forecast_mae']}")
+        lines.append(f"  Latest forecast MAE:   {idc['latest_forecast_mae']}")
+        lines.append(f"  Mean improvement:      {idc['mean_improvement']} p/kWh")
+        lines.append(f"  % slots improved:      {idc['pct_improved']}%")
+        lines.append(f"  Avg earliest horizon:  {idc['avg_earliest_horizon_h']}h")
+        lines.append(f"  Avg latest horizon:    {idc['avg_latest_horizon_h']}h")
+
     # Training state
     lines.append("\n--- Training State ---")
     ts = result["training_state"]
@@ -574,6 +740,8 @@ def main():
         ),
         "head_to_head": compute_head_to_head(conn, args.days),
         "prediction_convergence": compute_prediction_convergence(conn, args.days),
+        "time_of_day_accuracy": compute_time_of_day_accuracy(conn, args.days),
+        "intraday_convergence": compute_intraday_convergence(conn, args.days),
         "training_state": compute_training_state(conn),
         "actual_price_statistics": compute_actual_price_statistics(conn, args.days),
     }
