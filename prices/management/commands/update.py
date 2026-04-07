@@ -196,21 +196,24 @@ class Command(BaseCommand):
         # don't re-write records already in the DB, but don't gate on prices.index[-1]
         # (that would discard older pages as soon as one page is written).
         all_agile_pages = []
-        for page_agile in get_agile_pages(start=start, region="F"):
-            all_agile_pages.append(page_agile)
-            page_day_ahead = day_ahead_to_agile(page_agile, reverse=True, region="F")
-            page_new = pd.concat([page_day_ahead, page_agile], axis=1)
-            page_new = page_new[page_new.index >= start]
-            if len(page_new) > 0:
-                if debug:
-                    logger.info(f"New Prices (page)\n{page_new}")
-                logger.info(
-                    "Writing %d new price records to DB (up to %s)",
-                    len(page_new),
-                    page_new.index[-1],
-                )
-                df_to_Model(page_new, PriceHistory, update=True)
-                prices = pd.concat([prices, page_new]).sort_index()
+        try:
+            for page_agile in get_agile_pages(start=start, region="F"):
+                all_agile_pages.append(page_agile)
+                page_day_ahead = day_ahead_to_agile(page_agile, reverse=True, region="F")
+                page_new = pd.concat([page_day_ahead, page_agile], axis=1)
+                page_new = page_new[page_new.index >= start]
+                if len(page_new) > 0:
+                    if debug:
+                        logger.info(f"New Prices (page)\n{page_new}")
+                    logger.info(
+                        "Writing %d new price records to DB (up to %s)",
+                        len(page_new),
+                        page_new.index[-1],
+                    )
+                    df_to_Model(page_new, PriceHistory, update=True)
+                    prices = pd.concat([prices, page_new]).sort_index()
+        except Exception as e:
+            logger.warning("Octopus Agile price fetch failed: %s — continuing with existing PriceHistory", e)
 
         agile = (
             pd.concat(all_agile_pages).sort_index()
@@ -226,6 +229,10 @@ class Command(BaseCommand):
 
         if debug:
             logger.info(f"GB60:\n{gb60}")
+
+        if gb60 is None:
+            logger.warning("GB60: Nord Pool API unavailable, continuing without day-ahead wholesale prices")
+            gb60 = pd.Series(dtype=float)
 
         gb60 = gb60.resample("30min").ffill().loc[agile_end + pd.Timedelta("30min") :]
 
@@ -1819,6 +1826,17 @@ class Command(BaseCommand):
                     ag["forecast"] = this_forecast
                     df_to_Model(fc, ForecastData)
                     df_to_Model(ag, AgileData)
+
+        # --- Data source health summary ---
+        logger.info(
+            "Data sources: Agile=%d pages, GB60=%s, MID=%d, Elexon=%s, Interconnector=%s, Margin=%s, Commodity=ok",
+            len(all_agile_pages),
+            "ok" if isinstance(gb60, pd.DataFrame) and len(gb60) > 0 else "unavailable",
+            len(mid_auction) if hasattr(mid_auction, '__len__') else 0,
+            "ok" if elexon_features_available else "unavailable",
+            "ok" if interconnector_available else "unavailable",
+            "ok" if margin_available else "unavailable",
+        )
 
         # --- Fetch official agilepredict.com predictions for comparison ---
         try:
