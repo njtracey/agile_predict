@@ -208,11 +208,11 @@ def fetch_commodity_history(cache_path="cache/commodity_history.json"):
             "gas_price_ptherm": pd.Series(gas_daily),
             "carbon_price_eur": pd.Series(carbon_daily),
         })
-        df = df.sort_index().ffill().bfill()
+        df = df.sort_index().ffill()  # Forward-fill only (no bfill — don't fabricate old prices)
 
         cache_data = {
             "last_updated": pd.Timestamp.now(tz="UTC").isoformat(),
-            "prices": df.to_dict(),
+            "prices": df.rename(index=lambda x: x.isoformat()).to_dict(),
         }
         with open(cache_path, "w") as f:
             json.dump(cache_data, f, indent=2, default=str)
