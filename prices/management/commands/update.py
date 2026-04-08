@@ -392,28 +392,30 @@ class Command(BaseCommand):
                         if debug:
                             logger.info(f"Forecasts Database:\n{ff.to_string()}")
 
-                        # df is the full dataset
+                        # df is the full dataset — keep date_time as a column (RangeIndex)
+                        # to avoid duplicate-index bugs when multiple forecasts
+                        # predict the same settlement period.
                         df = (
                             (fd.merge(ff, right_index=True, left_on="forecast_id"))
-                            .set_index("date_time")
                             .drop("day_ahead", axis=1)
                         )
+                        df["date_time"] = pd.to_datetime(df["date_time"], utc=True)
 
-                        df["dow"] = df.index.day_of_week
-                        df["weekend"] = (df.index.day_of_week >= 5).astype(int)
-                        df["time"] = df.index.tz_convert("GB").hour + df.index.minute / 60
+                        df["dow"] = df["date_time"].dt.day_of_week
+                        df["weekend"] = (df["date_time"].dt.day_of_week >= 5).astype(int)
+                        df["time"] = df["date_time"].dt.tz_convert("GB").dt.hour + df["date_time"].dt.tz_convert("GB").dt.minute / 60
                         df["days_ago"] = (
                             (pd.Timestamp.now(tz="UTC") - df["created_at"]).dt.total_seconds()
                             / 3600
                             / 24
                         )
-                        df["dt"] = (df.index - df["created_at"]).dt.total_seconds() / 3600 / 24
+                        df["dt"] = (df["date_time"] - df["created_at"]).dt.total_seconds() / 3600 / 24
                         df["peak"] = ((df["time"] >= 16) & (df["time"] < 19)).astype(float)
 
                         # Cyclical time encoding for seasonal/diurnal patterns
-                        time_gb = df.index.tz_convert("GB")
-                        hour = time_gb.hour + time_gb.minute / 60
-                        month = time_gb.month
+                        time_gb = df["date_time"].dt.tz_convert("GB")
+                        hour = time_gb.dt.hour + time_gb.dt.minute / 60
+                        month = time_gb.dt.month
                         df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
                         df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
                         df["month_sin"] = np.sin(2 * np.pi * month / 12)
@@ -437,7 +439,7 @@ class Command(BaseCommand):
                         lag_features = lag_features.fillna(price_mean)
 
                         for col in lag_features.columns:
-                            df[col] = lag_features[col].reindex(df.index).fillna(price_mean)
+                            df[col] = df["date_time"].map(lag_features[col]).fillna(price_mean)
 
                         # --- Price volatility features ---
                         vol_7d = price_series.rolling(7 * 48, min_periods=48).std()
@@ -448,8 +450,8 @@ class Command(BaseCommand):
                             vol_7d = vol_7d.fillna(0.0)
                             vol_30d = vol_30d.fillna(0.0)
 
-                        df["price_volatility_7d"] = vol_7d.reindex(df.index).ffill().fillna(0.0)
-                        df["price_volatility_30d"] = vol_30d.reindex(df.index).ffill().fillna(0.0)
+                        df["price_volatility_7d"] = df["date_time"].map(vol_7d).ffill().fillna(0.0)
+                        df["price_volatility_30d"] = df["date_time"].map(vol_30d).ffill().fillna(0.0)
 
                         # --- Residual demand feature ---
                         df["residual_demand"] = df["demand"] - df["bm_wind"] - df["solar"]
@@ -469,9 +471,9 @@ class Command(BaseCommand):
                             commodity_hist.index = pd.to_datetime(commodity_hist["date"])
                             commodity_hist = commodity_hist.drop("date", axis=1).sort_index()
                             # Merge by date: each training sample gets the commodity price from its target date
-                            df_dates = df.index.normalize()
-                            df["gas_price_ptherm"] = commodity_hist["gas_price_ptherm"].reindex(df_dates).ffill().bfill().values
-                            df["carbon_price_eur"] = commodity_hist["carbon_price_eur"].reindex(df_dates).ffill().bfill().values
+                            df_dates = df["date_time"].dt.normalize()
+                            df["gas_price_ptherm"] = df_dates.map(commodity_hist["gas_price_ptherm"]).ffill().bfill()
+                            df["carbon_price_eur"] = df_dates.map(commodity_hist["carbon_price_eur"]).ffill().bfill()
                             # Fill any remaining NaN (dates outside DB range) with today's price
                             df["gas_price_ptherm"] = df["gas_price_ptherm"].fillna(commodity_prices["gas_price_ptherm"])
                             df["carbon_price_eur"] = df["carbon_price_eur"].fillna(commodity_prices["carbon_price_eur"])
@@ -497,9 +499,9 @@ class Command(BaseCommand):
 
                         if len(sys_prices_df) > 0 and len(ccgt_gen_df) > 0:
                             # Merge system prices into training data
-                            df["system_buy_price"] = sys_prices_df["system_buy_price"].reindex(df.index).ffill().bfill()
+                            df["system_buy_price"] = df["date_time"].map(sys_prices_df["system_buy_price"]).ffill().bfill()
                             # Merge CCGT generation into training data
-                            df["ccgt_generation_mw"] = ccgt_gen_df["ccgt_generation_mw"].reindex(df.index).ffill().bfill()
+                            df["ccgt_generation_mw"] = df["date_time"].map(ccgt_gen_df["ccgt_generation_mw"]).ffill().bfill()
                             # Compute derived ccgt_share feature
                             df["ccgt_share"] = df["ccgt_generation_mw"] / df["demand"].replace(0, float("nan")) * 100
                             df["ccgt_share"] = df["ccgt_share"].fillna(0.0)
@@ -518,7 +520,7 @@ class Command(BaseCommand):
 
                         # --- Interconnector flows (Req 3) ---
                         if len(interconnector_df) > 0:
-                            df["net_interconnector_mw"] = interconnector_df["net_interconnector_mw"].reindex(df.index).ffill().bfill()
+                            df["net_interconnector_mw"] = df["date_time"].map(interconnector_df["net_interconnector_mw"]).ffill().bfill()
                             if df["net_interconnector_mw"].notna().sum() > 0:
                                 df["net_interconnector_mw"] = df["net_interconnector_mw"].fillna(0.0)
                                 interconnector_available = True
@@ -534,8 +536,8 @@ class Command(BaseCommand):
                         margin_available = False
 
                         if len(margin_df) > 0:
-                            df["derated_margin_mw"] = margin_df["derated_margin_mw"].reindex(df.index).ffill().bfill()
-                            df["margin_nearest_mw"] = margin_df["margin_nearest_mw"].reindex(df.index).ffill().bfill()
+                            df["derated_margin_mw"] = df["date_time"].map(margin_df["derated_margin_mw"]).ffill().bfill()
+                            df["margin_nearest_mw"] = df["date_time"].map(margin_df["margin_nearest_mw"]).ffill().bfill()
                             if df["derated_margin_mw"].notna().sum() > 0:
                                 df["derated_margin_mw"] = df["derated_margin_mw"].fillna(0.0)
                                 df["margin_nearest_mw"] = df["margin_nearest_mw"].fillna(0.0)
@@ -616,23 +618,24 @@ class Command(BaseCommand):
 
                         # Only train on the next agile prices that are set from the pm auction
                         train_X = train_X[
-                            (train_X.index >= train_X["ag_start"])
-                            & (train_X.index < train_X["ag_end"])
+                            (train_X["date_time"] >= train_X["ag_start"])
+                            & (train_X["date_time"] < train_X["ag_end"])
                         ]
 
                         # --- Capture dt values BEFORE features-only selection (Req 5) ---
                         # dt is in df but not in features list; we need it for horizon splitting
-                        # Include dt temporarily in train_X so it survives the merge
-                        train_X["_dt"] = train_X["dt"]
+                        train_dt = train_X["dt"].reset_index(drop=True)
 
-                        train_X = train_X[features + ["_dt"]]
+                        train_X = train_X[features + ["date_time"]]
 
-                        # Get the prices to match the forecast
+                        # Get the prices to match the forecast — column-based merge on date_time
                         train_X = train_X.merge(
-                            prices["day_ahead"], left_index=True, right_index=True
+                            prices["day_ahead"].rename_axis("date_time").reset_index(),
+                            on="date_time",
+                            how="left",
                         )
-                        # Extract dt back out after merge
-                        train_dt = train_X.pop("_dt")
+                        # Drop date_time now that merge is done
+                        train_X = train_X.drop(columns=["date_time"])
 
                         if debug:
                             logger.info(f"train_X:\n{train_X}")
@@ -794,7 +797,6 @@ class Command(BaseCommand):
                             cal_dt = train_dt.iloc[cal_split:]
 
                             # Log calibration set info
-                            cal_dates = cal_X.index
                             logger.info(
                                 "Conformal calibration: fit=%d samples, cal=%d samples (%.0f%%/%.0f%%)",
                                 len(fit_X), len(cal_X),
@@ -802,8 +804,8 @@ class Command(BaseCommand):
                                 100 * len(cal_X) / len(train_X),
                             )
                             logger.info(
-                                "Conformal calibration set: %s to %s",
-                                cal_dates.min(), cal_dates.max(),
+                                "Conformal calibration set: split at row %d of %d",
+                                cal_split, len(train_X),
                             )
 
                             # Train calibration models on the 80% fit set
@@ -1092,13 +1094,15 @@ class Command(BaseCommand):
                         test_X = df[~df["forecast_id"].isin(ff_train.index)]
 
                         # Drop any data which is actual ir dt < 0
-                        test_X = test_X[test_X.index > test_X["ag_start"]]
+                        test_X = test_X[test_X["date_time"] > test_X["ag_start"]]
 
                         # Drop the old data
                         test_X = test_X[test_X["days_ago"] < max_days]
 
                         test_X = test_X.merge(
-                            prices["day_ahead"], left_index=True, right_index=True
+                            prices["day_ahead"].rename_axis("date_time").reset_index(),
+                            on="date_time",
+                            how="left",
                         )
                         test_y = test_X["day_ahead"]
 
@@ -1161,10 +1165,10 @@ class Command(BaseCommand):
 
                         # Add required columns before plotting
                         if len(test_X) > 0:
-                            results["forecast_created"] = test_X["created_at"]
-                            results["target_time"] = test_X.index
-                            results["next_agile"] = (test_X.index >= test_X["ag_start"]) & (
-                                test_X.index < test_X["ag_end"]
+                            results["forecast_created"] = test_X["created_at"].values
+                            results["target_time"] = test_X["date_time"].values
+                            results["next_agile"] = (test_X["date_time"].values >= test_X["ag_start"].values) & (
+                                test_X["date_time"].values < test_X["ag_end"].values
                             )
                             results["error"] = (results["day_ahead"] - results["pred"]) * factor
 
