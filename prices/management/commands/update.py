@@ -622,20 +622,20 @@ class Command(BaseCommand):
                             & (train_X["date_time"] < train_X["ag_end"])
                         ]
 
-                        # --- Capture dt values BEFORE features-only selection (Req 5) ---
+                        # --- Carry dt through the merge so it stays aligned (Req 5) ---
                         # dt is in df but not in features list; we need it for horizon splitting
-                        train_dt = train_X["dt"].reset_index(drop=True)
-
-                        train_X = train_X[features + ["date_time"]]
+                        train_X = train_X[features + ["date_time", "dt"]]
 
                         # Get the prices to match the forecast — column-based merge on date_time
                         train_X = train_X.merge(
                             prices["day_ahead"].rename_axis("date_time").reset_index(),
                             on="date_time",
-                            how="left",
+                            how="inner",
                         )
                         # Drop date_time now that merge is done
                         train_X = train_X.drop(columns=["date_time"])
+                        # Extract dt after merge so it stays aligned with train_X
+                        train_dt = train_X.pop("dt")
 
                         if debug:
                             logger.info(f"train_X:\n{train_X}")
@@ -1102,7 +1102,7 @@ class Command(BaseCommand):
                         test_X = test_X.merge(
                             prices["day_ahead"].rename_axis("date_time").reset_index(),
                             on="date_time",
-                            how="left",
+                            how="inner",
                         )
                         test_y = test_X["day_ahead"]
 
