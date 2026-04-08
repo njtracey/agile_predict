@@ -349,6 +349,7 @@ class Command(BaseCommand):
                     elexon_features_available = False  # track whether Elexon API data was fetched successfully
                     interconnector_available = False  # track whether interconnector API data was fetched successfully
                     margin_available = False  # track whether derated margin API data was fetched successfully
+                    french_nuclear_available = False  # track whether French nuclear data was fetched successfully
                     conformal_offsets = {}  # conformal prediction offsets per horizon (Req 10)
                     cal_coverage_rate = None  # conformal calibration coverage rate (Req 10)
 
@@ -518,6 +519,14 @@ class Command(BaseCommand):
                         else:
                             logger.warning("Derated margin features: API returned empty data, omitting from this run")
 
+                        # --- French nuclear availability (Req 4 - Round 2) ---
+                        french_nuclear_gw = fetch_french_nuclear()
+                        french_nuclear_available = french_nuclear_gw is not None
+
+                        if french_nuclear_available:
+                            df["french_nuclear_gw"] = french_nuclear_gw  # scalar, same value for all rows
+                            logger.info("French nuclear feature: %.2f GW", french_nuclear_gw)
+
                         features = [
                             "bm_wind",
                             "solar",
@@ -568,6 +577,10 @@ class Command(BaseCommand):
                         # Conditionally add derated margin features (Req 1 - Round 2)
                         if margin_available:
                             features.extend(["derated_margin_mw", "margin_nearest_mw"])
+
+                        # Conditionally add French nuclear feature (Req 4 - Round 2)
+                        if french_nuclear_available:
+                            features.append("french_nuclear_gw")
 
                         # Only use the forecasts closest to 16:15 for training
                         train_X = df[df["forecast_id"].isin(ff_train.index)]
@@ -1412,6 +1425,14 @@ class Command(BaseCommand):
                             latest_margin, latest_nearest,
                         )
 
+                    # --- French nuclear feature for prediction data (Req 4 - Round 2) ---
+                    if len(ff) > 0 and french_nuclear_available:
+                        fc["french_nuclear_gw"] = french_nuclear_gw
+                        logger.info(
+                            "French nuclear prediction feature: french_nuclear_gw=%.2f GW",
+                            french_nuclear_gw,
+                        )
+
                     if len(ff) > 0:
                         fc_pred_input = fc.drop("emb_wind", axis=1).reindex(train_X.columns, axis=1)
 
@@ -1829,13 +1850,14 @@ class Command(BaseCommand):
 
         # --- Data source health summary ---
         logger.info(
-            "Data sources: Agile=%d pages, GB60=%s, MID=%d, Elexon=%s, Interconnector=%s, Margin=%s, Commodity=ok",
+            "Data sources: Agile=%d pages, GB60=%s, MID=%d, Elexon=%s, Interconnector=%s, Margin=%s, Nuclear=%s, Commodity=ok",
             len(all_agile_pages),
             "ok" if isinstance(gb60, pd.DataFrame) and len(gb60) > 0 else "unavailable",
             len(mid_auction) if hasattr(mid_auction, '__len__') else 0,
             "ok" if elexon_features_available else "unavailable",
             "ok" if interconnector_available else "unavailable",
             "ok" if margin_available else "unavailable",
+            "ok" if french_nuclear_available else "unavailable",
         )
 
         # --- Fetch official agilepredict.com predictions for comparison ---

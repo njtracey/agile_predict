@@ -1,5 +1,6 @@
 import json
 import os
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -39,6 +40,11 @@ OILPRICE_API_KEY = "09287899c129971df72aa7166ab8243649c5dbbb04eadd292fa5c3a1d5c2
 # Default commodity prices used when API and cache are both unavailable
 DEFAULT_GAS_PRICE_PTHERM = 80.0
 DEFAULT_CARBON_PRICE_EUR = 70.0
+
+# ENTSO-E Transparency Platform token for French nuclear generation data
+ENTSOE_TOKEN = "0aa5358f-ef17-4e49-86f9-5444b375f538"
+ENTSOE_NUCLEAR_CACHE = "cache/french_nuclear.json"
+ENTSOE_CACHE_HOURS = 6
 
 
 def fetch_commodity_prices(cache_path="cache/commodity_prices.json"):
@@ -413,6 +419,107 @@ def fetch_derated_margin(date_from, date_to):
         len(df), df.index[0], df.index[-1],
     )
     return df
+
+
+def _load_stale_cache(cache_path: str) -> float | None:
+    """Load stale cache as fallback when API fails."""
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            logger.warning("French nuclear: using stale cache as fallback")
+            return cached["french_nuclear_gw"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+    logger.warning("French nuclear: no cache available, omitting feature")
+    return None
+
+
+def fetch_french_nuclear(cache_path: str = ENTSOE_NUCLEAR_CACHE) -> float | None:
+    """Fetch latest French nuclear generation from ENTSO-E, with caching.
+
+    Returns nuclear generation in GW, or None if unavailable.
+    Uses cache if less than 6 hours old. Falls back to stale cache on API failure.
+    """
+    if not ENTSOE_TOKEN:
+        logger.info("ENTSO-E token not configured, skipping French nuclear feature")
+        return None
+
+    # Ensure cache directory exists
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    # Check cache freshness
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            age_hours = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(cached["last_updated"])).total_seconds() / 3600
+            if age_hours < ENTSOE_CACHE_HOURS:
+                logger.info("French nuclear: using cache (%.1f hours old)", age_hours)
+                return cached["french_nuclear_gw"]
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("French nuclear: cache read error: %s", e)
+
+    # Fetch from ENTSO-E API
+    try:
+        now = pd.Timestamp.now(tz="UTC")
+        period_start = (now - pd.Timedelta(hours=6)).strftime("%Y%m%d%H%M")
+        period_end = now.strftime("%Y%m%d%H%M")
+
+        url = "https://web-api.tp.entsoe.eu/api"
+        params = {
+            "documentType": "A75",
+            "processType": "A16",
+            "in_Domain": "10YFR-RTE------C",
+            "periodStart": period_start,
+            "periodEnd": period_end,
+            "securityToken": ENTSOE_TOKEN,
+        }
+        logger.info("French nuclear: fetching from ENTSO-E (%s to %s)", period_start, period_end)
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+
+        # Parse XML response
+        root = ET.fromstring(resp.text)
+        ns = {"ns": "urn:iec62325.351:tc57wg16:451-6:generationloaddocument:3:0"}
+
+        nuclear_mw = 0.0
+        nuclear_count = 0
+        for ts in root.findall(".//ns:TimeSeries", ns):
+            psr_type = ts.find(".//ns:MktPSRType/ns:psrType", ns)
+            if psr_type is not None and psr_type.text == "B14":
+                # Get the last (most recent) point in this time series
+                points = ts.findall(".//ns:Point", ns)
+                if points:
+                    last_point = points[-1]
+                    qty = last_point.find("ns:quantity", ns)
+                    if qty is not None:
+                        nuclear_mw += float(qty.text)
+                        nuclear_count += 1
+
+        if nuclear_count == 0:
+            logger.warning("French nuclear: no B14 data in ENTSO-E response")
+            return _load_stale_cache(cache_path)
+
+        nuclear_gw = nuclear_mw / 1000.0
+
+        # Write to cache
+        cache_data = {
+            "last_updated": now.isoformat(),
+            "french_nuclear_gw": nuclear_gw,
+            "data_timestamp": period_end,
+        }
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+
+        logger.info("French nuclear: %.2f GW (%d time series)", nuclear_gw, nuclear_count)
+        return nuclear_gw
+
+    except Exception as e:
+        logger.warning("French nuclear: ENTSO-E fetch failed: %s", e)
+        return _load_stale_cache(cache_path)
 
 
 def fetch_day_ahead_auction(date_from, date_to):
