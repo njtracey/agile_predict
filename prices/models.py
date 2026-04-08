@@ -43,6 +43,17 @@ class OfficialAgileData(models.Model):
         unique_together = ("forecast", "date_time")
 
 
+class CommodityPriceHistory(models.Model):
+    """Daily gas and carbon prices, accumulated automatically from OilPriceAPI."""
+
+    date = models.DateField(unique=True)
+    gas_price_ptherm = models.FloatField()
+    carbon_price_eur = models.FloatField()
+
+    class Meta:
+        ordering = ["-date"]
+
+
 class History(models.Model):
     date_time = models.DateTimeField(unique=True)
     total_wind = models.FloatField()

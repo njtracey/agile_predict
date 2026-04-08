@@ -22,7 +22,7 @@ import os
 import logging
 
 from django.core.management.base import BaseCommand
-from ...models import History, PriceHistory, Forecasts, ForecastData, AgileData, OfficialAgileData
+from ...models import History, PriceHistory, Forecasts, ForecastData, AgileData, OfficialAgileData, CommodityPriceHistory
 
 from config.utils import *
 from config.settings import GLOBAL_SETTINGS
@@ -184,6 +184,17 @@ class Command(BaseCommand):
             "Commodity prices: gas=%.2f p/therm, carbon=%.2f EUR/tonne",
             commodity_prices["gas_price_ptherm"],
             commodity_prices["carbon_price_eur"],
+        )
+
+        # Store today's commodity prices in DB for historical accumulation
+        import datetime as _dt
+        today = _dt.date.today()
+        CommodityPriceHistory.objects.update_or_create(
+            date=today,
+            defaults={
+                "gas_price_ptherm": commodity_prices["gas_price_ptherm"],
+                "carbon_price_eur": commodity_prices["carbon_price_eur"],
+            },
         )
 
         prices, start = model_to_df(PriceHistory)
@@ -451,8 +462,25 @@ class Command(BaseCommand):
                         )
 
                         # --- Commodity price features (Req 2) ---
-                        df["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
-                        df["carbon_price_eur"] = commodity_prices["carbon_price_eur"]
+                        # Use historical daily prices from DB when available, fall back to today's price
+                        commodity_qs = CommodityPriceHistory.objects.all()
+                        if commodity_qs.exists():
+                            commodity_hist = pd.DataFrame(list(commodity_qs.values("date", "gas_price_ptherm", "carbon_price_eur")))
+                            commodity_hist.index = pd.to_datetime(commodity_hist["date"])
+                            commodity_hist = commodity_hist.drop("date", axis=1).sort_index()
+                            # Merge by date: each training sample gets the commodity price from its target date
+                            df_dates = df.index.normalize()
+                            df["gas_price_ptherm"] = commodity_hist["gas_price_ptherm"].reindex(df_dates).ffill().bfill().values
+                            df["carbon_price_eur"] = commodity_hist["carbon_price_eur"].reindex(df_dates).ffill().bfill().values
+                            # Fill any remaining NaN (dates outside DB range) with today's price
+                            df["gas_price_ptherm"] = df["gas_price_ptherm"].fillna(commodity_prices["gas_price_ptherm"])
+                            df["carbon_price_eur"] = df["carbon_price_eur"].fillna(commodity_prices["carbon_price_eur"])
+                            logger.info("Commodity features: merged %d days of historical prices from DB", len(commodity_hist))
+                        else:
+                            # No history yet — use today's price as constant (will accumulate over time)
+                            df["gas_price_ptherm"] = commodity_prices["gas_price_ptherm"]
+                            df["carbon_price_eur"] = commodity_prices["carbon_price_eur"]
+                            logger.info("Commodity features: using today's price as constant (no history in DB yet)")
 
                         # --- Elexon system prices and CCGT generation (Req 2) ---
                         # Fetch last 30 days only (not full training range — too many API calls)

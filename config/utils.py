@@ -158,6 +158,85 @@ def fetch_commodity_prices(cache_path="cache/commodity_prices.json"):
         return defaults
 
 
+def fetch_commodity_history(cache_path="cache/commodity_history.json"):
+    """Fetch historical daily gas and carbon prices from OilPriceAPI (past month).
+
+    Returns DataFrame with 'gas_price_ptherm' and 'carbon_price_eur' columns
+    indexed by UTC date. Uses cache if less than 24 hours old.
+    Returns empty DataFrame on failure.
+    """
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            last_updated = pd.Timestamp(cached["last_updated"])
+            age_hours = (pd.Timestamp.now(tz="UTC") - last_updated).total_seconds() / 3600
+            if age_hours < 24:
+                df = pd.DataFrame(cached["prices"])
+                if len(df) > 0:
+                    df.index = pd.to_datetime(df.index)
+                    logger.info("Commodity history: using cache (%.1f hours old, %d days)", age_hours, len(df))
+                    return df
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("Commodity history: cache read error: %s", e)
+
+    headers = {"Authorization": f"Token {OILPRICE_API_KEY}"}
+    gas_daily = {}
+    carbon_daily = {}
+
+    try:
+        for code, target_dict in [("NATURAL_GAS_GBP", gas_daily), ("EU_CARBON_EUR", carbon_daily)]:
+            url = "https://api.oilpriceapi.com/v1/prices/past_month"
+            params = {"by_code": code}
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("data", {}).get("prices", []):
+                dt = pd.Timestamp(item["created_at"]).normalize()
+                price = float(item["price"])
+                target_dict[dt] = price
+
+        if not gas_daily and not carbon_daily:
+            logger.warning("Commodity history: no data returned from API")
+            return pd.DataFrame()
+
+        df = pd.DataFrame({
+            "gas_price_ptherm": pd.Series(gas_daily),
+            "carbon_price_eur": pd.Series(carbon_daily),
+        })
+        df = df.sort_index().ffill().bfill()
+
+        cache_data = {
+            "last_updated": pd.Timestamp.now(tz="UTC").isoformat(),
+            "prices": df.to_dict(),
+        }
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2, default=str)
+
+        logger.info("Commodity history: fetched %d days (%s to %s)",
+                     len(df), df.index[0].date(), df.index[-1].date())
+        return df
+
+    except Exception as e:
+        logger.warning("Commodity history: API fetch failed: %s", e)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    cached = json.load(f)
+                df = pd.DataFrame(cached["prices"])
+                if len(df) > 0:
+                    df.index = pd.to_datetime(df.index)
+                    logger.warning("Commodity history: using stale cache as fallback")
+                    return df
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return pd.DataFrame()
+
+
 def fetch_system_prices(date_from, date_to):
     """Fetch half-hourly system buy prices from Elexon BMRS.
 
