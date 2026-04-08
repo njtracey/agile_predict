@@ -10,3 +10,4 @@ static/
 plots/
 .DS_Store
 venv/
+cache/
